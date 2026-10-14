@@ -14,19 +14,20 @@
 //! frame:              page_id u64 | commit u32 | salt u32 | crc u32 | pad u32 | page
 //! ```
 //!
-//! The frame crc covers the first 16 header bytes and the page. The salt
-//! changes on every reset, so frames left over from an earlier generation
-//! are never mistaken for current ones.
+//! Pages arrive sealed with their own trailing CRC-32C, so the frame crc only
+//! covers the first 16 header bytes plus that page checksum; recovery checks
+//! both. The salt changes on every reset, so frames left over from an earlier
+//! generation are never mistaken for current ones.
 
-use std::collections::HashMap;
 use std::fs::File;
 
 use crate::crc32::{Hasher, crc32};
 use crate::error::{Error, Result};
+use crate::hash::IdMap;
 use crate::io::{read_at, write_at};
 use crate::pager::PageId;
 
-const MAGIC: &[u8; 16] = b"graphlite wal 1\0";
+const MAGIC: &[u8; 16] = b"graphlite wal 2\0";
 const HEADER_SIZE: u64 = 32;
 const FRAME_HEADER_SIZE: usize = 24;
 
@@ -39,9 +40,9 @@ pub struct Wal {
     /// Frames `[committed_frames, frames)` belong to the open transaction.
     frames: u64,
     /// Latest committed frame for each page.
-    committed: HashMap<PageId, u64>,
+    committed: IdMap<u64>,
     /// Latest frame for each page written by the open transaction.
-    pending: HashMap<PageId, u64>,
+    pending: IdMap<u64>,
     /// Reused buffer for one frame (header + page).
     buf: Vec<u8>,
 }
@@ -56,8 +57,8 @@ impl Wal {
             salt: 0,
             committed_frames: 0,
             frames: 0,
-            committed: HashMap::new(),
-            pending: HashMap::new(),
+            committed: IdMap::default(),
+            pending: IdMap::default(),
             buf: vec![0u8; FRAME_HEADER_SIZE + page_size],
         };
         match wal.read_header()? {
@@ -103,7 +104,7 @@ impl Wal {
             let h = &self.buf[..FRAME_HEADER_SIZE];
             let salt = u32::from_le_bytes(h[12..16].try_into().unwrap());
             let crc = u32::from_le_bytes(h[16..20].try_into().unwrap());
-            if salt != self.salt || crc != frame_crc(&self.buf) {
+            if salt != self.salt || crc != frame_crc(&self.buf) || !page_intact(&self.buf[FRAME_HEADER_SIZE..]) {
                 break;
             }
             let id = u64::from_le_bytes(h[0..8].try_into().unwrap());
@@ -151,7 +152,8 @@ impl Wal {
         read_at(&self.file, buf, self.frame_offset(n) + FRAME_HEADER_SIZE as u64)
     }
 
-    /// Writes `page` as the newest version of `id` in the open transaction.
+    /// Writes `page`, which must carry its checksum in its last 4 bytes, as
+    /// the newest version of `id` in the open transaction.
     /// A page already written by this transaction is overwritten in place,
     /// since no committed state depends on that frame.
     pub fn write(&mut self, id: PageId, page: &[u8], commit: bool) -> Result<()> {
@@ -220,8 +222,13 @@ impl Wal {
 fn frame_crc(frame: &[u8]) -> u32 {
     let mut c = Hasher::new();
     c.update(&frame[..16]);
-    c.update(&frame[FRAME_HEADER_SIZE..]);
+    c.update(&frame[frame.len() - 4..]);
     c.finish()
+}
+
+fn page_intact(page: &[u8]) -> bool {
+    let (body, sum) = page.split_at(page.len() - 4);
+    crc32(body) == u32::from_le_bytes(sum.try_into().unwrap())
 }
 
 fn seed_salt() -> u32 {

@@ -72,7 +72,7 @@ fn bench(path: &str, edges: u64, nodes: u64) -> graphlite::Result<()> {
         db.size() as f64 / edges as f64
     );
 
-    let queries = 10_000;
+    let queries = 100_000;
     let mut found = 0u64;
     let start = Instant::now();
     for _ in 0..queries {

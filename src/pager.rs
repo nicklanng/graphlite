@@ -2,7 +2,7 @@
 //! with clock eviction, with transactions on top of the write-ahead log.
 //!
 //! Page 0 holds the file header. Every page reserves its trailing 4 bytes for
-//! a CRC-32 of the rest of the page, verified on every read, so torn or
+//! a CRC-32C of the rest of the page, verified on every read, so torn or
 //! bit-rotted pages are reported instead of silently trusted.
 //!
 //! Callers pin a page with [`Pager::get`] or [`Pager::allocate`], access it
@@ -15,11 +15,11 @@
 //! last commit. Once the WAL grows past `wal_autocheckpoint` frames, a
 //! checkpoint copies committed pages into the main file.
 
-use std::collections::HashMap;
 use std::fs::File;
 
 use crate::crc32::crc32;
 use crate::error::{Error, Result};
+use crate::hash::IdMap;
 use crate::io::{read_at, write_at};
 use crate::wal::Wal;
 
@@ -35,7 +35,8 @@ pub const MAX_PAGE_SIZE: u32 = 65536;
 const MIN_CACHE_PAGES: usize = 8;
 
 const MAGIC: &[u8; 16] = b"graphlite fmt 1\0";
-const FORMAT_VERSION: u32 = 1;
+/// 2: CRC-32C page checksums.
+const FORMAT_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 48;
 
 #[derive(Clone, Debug)]
@@ -144,7 +145,7 @@ pub struct Pager {
     committed: Meta,
     frames: Vec<Frame>,
     slab: Vec<u8>,
-    map: HashMap<PageId, u32>,
+    map: IdMap<u32>,
     hand: usize,
     autocheckpoint: u64,
     stats: Stats,
@@ -194,7 +195,7 @@ impl Pager {
             committed: meta,
             frames: (0..n).map(|_| Frame::default()).collect(),
             slab: vec![0u8; n * page_size],
-            map: HashMap::with_capacity(n),
+            map: IdMap::with_capacity_and_hasher(n, Default::default()),
             hand: 0,
             autocheckpoint: opts.wal_autocheckpoint.max(1),
             stats: Stats::default(),
@@ -363,9 +364,17 @@ impl Pager {
         let mut pages: Vec<(PageId, u64)> = self.wal.committed_pages().collect();
         pages.sort_unstable();
         for (id, n) in pages {
+            let offset = id * self.page_size as u64;
+            // With no open transaction, a cached page is clean, sealed, and
+            // identical to its newest committed frame, so skip the WAL read.
+            if let Some(&i) = self.map.get(&id) {
+                debug_assert!(!self.frames[i as usize].dirty);
+                write_at(&self.file, &self.slab[self.frame_range(i)], offset)?;
+                continue;
+            }
             self.wal.read_page(n, &mut buf)?;
             verify(&buf)?;
-            write_at(&self.file, &buf, id * self.page_size as u64)?;
+            write_at(&self.file, &buf, offset)?;
         }
         self.file.sync_data()?;
         self.wal.reset()?;

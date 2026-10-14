@@ -38,7 +38,7 @@ for friend in db.neighbors(alice, "KNOWS", Direction::Out)? {
   uncommitted changes.
 - **Crash safety**: changes go to a write-ahead log (`<file>-wal`), and a
   commit is a single fsync. After a crash, the database reopens in exactly
-  the state of the last commit. Every page carries a CRC-32, so corruption
+  the state of the last commit. Every page carries a CRC-32C, so corruption
   surfaces as `Error::Corrupt` rather than as wrong data.
 - **One process, one handle**: the file is locked while it's open. `Db` is
   `Send`; share it across threads behind a `Mutex`.
@@ -68,20 +68,49 @@ randomized B+tree test against a reference `BTreeMap`. The 15 tests in
 - file locking
 - a random graph checked against an in-memory model across reopens
 
-## Baseline numbers
+## Performance
 
-M-series laptop, 4 KiB pages, 16 MiB cache, random edges, committing every
-100k edges, `cargo build --release`:
+M-series laptop, 4 KiB pages, 16 MiB cache, random edges, `cargo build --release`.
+Run `graphlite bench <path> 2000000`, then
+`cargo run --release --example read_bench -- <path>`:
 
 ```
-load:   200000 nodes, 2000000 edges in 96.12s (20807 edges/s, commit every 100000)
-size:   157.8 MiB (82.7 bytes/edge)
-scan:   10000 neighbor lists in 90.94ms (9.1 us/list, 2.5 neighbors avg)
+load:   200000 nodes, 2000000 edges in 13.78s (145178 edges/s, commit every 100000)
+size:   157.6 MiB (82.6 bytes/edge)
+neighbors:     1000000 in 1.15s (1.15 us each)
+2-hop traverse: 10000 in 151.97ms (15.20 us each, 110 nodes avg)
+shortest path: 1000 in 523.96ms (0.52 ms each, 5.4 nodes avg)
 ```
 
-Loading is the weak spot. Random inserts into a tree ten times larger than
-the cache keep evicting pages, and each edge also checks that both nodes
-exist. Files are also large: each edge is stored as two uncompressed keys.
+A profiling pass with [samply](https://github.com/mstange/samply) gave these
+gains over the first version on the same workload:
+
+| | before | after | change |
+|---|---|---|---|
+| Load | 20.8k edges/s | 145k edges/s | 7× |
+| Neighbor list | 9.1 µs | 1.15 µs | 8× |
+| Shortest path (1M edges) | 20 ms | 0.25 ms | 80× |
+
+Where the time went, and the fixes:
+
+- **Page checksums (about 78% of load time).** CRC-32 was computed one byte
+  at a time, twice per WAL write. Now it's CRC-32C on the CPU's CRC
+  instructions, with three interleaved streams per page and one checksum per
+  write.
+- **Redundant tree lookups.** `add_edge` used 7 descents per edge; it now
+  uses 4. Counters are cached and written at commit, and an exists-check plus
+  insert became a single `put_if_absent`.
+- **Shortest path.** It now searches from both ends instead of one, and scans
+  keys without allocating.
+- **Smaller costs:** SipHash in page maps is replaced by a multiply-fold
+  hasher, key comparison is done 8 bytes at a time, and checkpoints reuse
+  cached pages instead of re-reading the WAL.
+
+Most of the remaining time is system calls for cache misses (`pread`,
+`pwrite`) and fsyncs. The graph is ten times larger than the cache.
+Compressed adjacency lists (a smaller working set), a bulk loader, and
+mmap-based reads are the next levers. Of the CPU time that's left, B+tree
+binary search takes the largest share.
 
 ## Roadmap
 

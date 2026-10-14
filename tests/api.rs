@@ -534,3 +534,76 @@ fn random_graph_matches_model_across_reopens() -> graphlite::Result<()> {
     }
     Ok(())
 }
+
+/// Bidirectional shortest_path must agree with a plain BFS on path length,
+/// and every returned path must follow real edges.
+#[test]
+fn shortest_path_matches_plain_bfs() -> graphlite::Result<()> {
+    use std::collections::{HashMap, VecDeque};
+
+    let dir = TempDir::new();
+    let mut db = Db::open(dir.db())?;
+    let mut rng = 0xDEAD_BEEF_1234_5678u64;
+    let mut rand = move |n: u64| {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        rng.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+    };
+    let nodes = 300u64;
+    for _ in 0..nodes {
+        db.create_node(&[])?;
+    }
+    for _ in 0..450 {
+        let t = if rand(3) == 0 { "B" } else { "A" };
+        db.add_edge(rand(nodes), t, rand(nodes))?;
+    }
+
+    for (edge_type, dir) in [
+        (None, Direction::Out),
+        (None, Direction::In),
+        (None, Direction::Both),
+        (Some("A"), Direction::Out),
+        (Some("A"), Direction::Both),
+    ] {
+        for _ in 0..60 {
+            let (from, to) = (rand(nodes), rand(nodes));
+            // Reference distances by plain BFS over the public API.
+            let mut dist = HashMap::from([(from, 0usize)]);
+            let mut queue = VecDeque::from([from]);
+            while let Some(u) = queue.pop_front() {
+                let mut next = Vec::new();
+                for t in edge_type.map_or(vec!["A", "B"], |t| vec![t]) {
+                    next.extend(db.neighbors(u, t, dir)?);
+                }
+                for v in next {
+                    if !dist.contains_key(&v) {
+                        dist.insert(v, dist[&u] + 1);
+                        queue.push_back(v);
+                    }
+                }
+            }
+            let path = db.shortest_path(from, to, edge_type, dir)?;
+            assert_eq!(path.as_ref().map(|p| p.len() - 1), dist.get(&to).copied(), "{from}->{to} {dir:?}");
+            let Some(path) = path else { continue };
+            assert_eq!((path[0], *path.last().unwrap()), (from, to));
+            for w in path.windows(2) {
+                let linked = |db: &mut Db, a, b| -> graphlite::Result<bool> {
+                    for t in edge_type.map_or(vec!["A", "B"], |t| vec![t]) {
+                        if db.has_edge(a, t, b)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                };
+                let ok = match dir {
+                    Direction::Out => linked(&mut db, w[0], w[1])?,
+                    Direction::In => linked(&mut db, w[1], w[0])?,
+                    Direction::Both => linked(&mut db, w[0], w[1])? || linked(&mut db, w[1], w[0])?,
+                };
+                assert!(ok, "path {path:?} uses a missing edge {}-{}", w[0], w[1]);
+            }
+        }
+    }
+    Ok(())
+}

@@ -26,6 +26,7 @@ pub mod btree;
 mod crc32;
 mod error;
 mod graph;
+mod hash;
 mod io;
 pub mod pager;
 #[cfg(test)]

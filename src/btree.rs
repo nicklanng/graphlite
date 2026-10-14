@@ -149,11 +149,21 @@ impl<'a> Node<'a> {
     /// Index of the first key >= `k`, and whether it equals `k`.
     fn lower_bound(self, k: &[u8]) -> (usize, bool) {
         let (mut lo, mut hi) = (0, self.count());
+        let mut found = false;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.key(mid) < k { lo = mid + 1 } else { hi = mid }
+            match compare(self.key(mid), k) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Equal => {
+                    // Keys are unique: this is the lower bound.
+                    hi = mid;
+                    lo = mid;
+                    found = true;
+                }
+                Ordering::Greater => hi = mid,
+            }
         }
-        (lo, lo < self.count() && self.key(lo) == k)
+        (lo, found)
     }
 
     /// Index of the child subtree that may contain `k`: the first i with k < key(i).
@@ -161,10 +171,32 @@ impl<'a> Node<'a> {
         let (mut lo, mut hi) = (0, self.count());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if k.cmp(self.key(mid)) == Ordering::Less { hi = mid } else { lo = mid + 1 }
+            if compare(k, self.key(mid)) == Ordering::Less { hi = mid } else { lo = mid + 1 }
         }
         lo
     }
+}
+
+/// Bytewise key order. Compares 8 bytes at a time, which beats a `memcmp`
+/// call for the short keys that dominate (edge keys are 21 bytes).
+#[inline]
+fn compare(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    let (wa, _) = a[..n].as_chunks::<8>();
+    let (wb, _) = b[..n].as_chunks::<8>();
+    for (x, y) in wa.iter().zip(wb) {
+        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    let done = wa.len() * 8;
+    for (x, y) in a[done..n].iter().zip(&b[done..n]) {
+        if x != y {
+            return x.cmp(y);
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Mutable view of a node page.
@@ -331,6 +363,18 @@ pub struct BTree {
     max_cell: usize,
     /// Overflow chain of a value replaced during an insert, freed afterwards.
     orphan: Option<PageId>,
+    /// Whether the last insert found its key already present.
+    existed: bool,
+}
+
+/// One insert, threaded down the tree.
+struct Insert<'a> {
+    key: &'a [u8],
+    /// The value, or an overflow stub.
+    value: &'a [u8],
+    overflow: bool,
+    /// Replace an existing value; otherwise leave it untouched.
+    replace: bool,
 }
 
 impl BTree {
@@ -358,6 +402,7 @@ impl BTree {
             scratch: vec![0u8; usable],
             max_cell: (usable - HEADER_SIZE) / 4 - SLOT_SIZE,
             orphan: None,
+            existed: false,
             pager,
             root,
         }
@@ -407,23 +452,40 @@ impl BTree {
     /// Inserts or replaces `key`. Values of any size are accepted; keys are
     /// limited to [`BTree::max_key_len`].
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.upsert(key, value, true).map(|_| ())
+    }
+
+    /// Inserts `key` unless it is already present, in a single descent.
+    /// Returns whether it was inserted.
+    pub fn put_if_absent(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.upsert(key, value, false)
+    }
+
+    /// Returns whether `key` was absent before the call.
+    fn upsert(&mut self, key: &[u8], value: &[u8], replace: bool) -> Result<bool> {
         if key.len() > self.max_key_len() {
             return Err(Error::TooLarge);
         }
+        let inline = key.len() + value.len() <= self.max_inline();
+        if !inline && !replace && self.contains(key)? {
+            return Ok(false); // don't write an overflow chain we would discard
+        }
         let stub;
-        let (stored, overflow) = if key.len() + value.len() <= self.max_inline() {
+        let (stored, overflow) = if inline {
             (value, false)
         } else {
             let first = self.write_overflow(value)?;
             stub = [(value.len() as u64).to_le_bytes(), first.to_le_bytes()].concat();
             (&stub[..], true)
         };
-        let split = self.insert(self.root, key, stored, overflow)?;
+        self.existed = false;
+        let split = self.insert(self.root, &Insert { key, value: stored, overflow, replace })?;
         if let Some(first) = self.orphan.take() {
             self.free_overflow(first)?;
         }
+        let absent = !self.existed;
         let Some(split) = split else {
-            return Ok(());
+            return Ok(absent);
         };
         // Keep the root id stable: move its contents to a new left child.
         let left = self.pager.allocate()?;
@@ -442,7 +504,7 @@ impl BTree {
         n.set_link(split.right);
         self.pager.release(root);
         self.pager.release(left);
-        Ok(())
+        Ok(absent)
     }
 
     /// Removes `key`, returning whether it was present.
@@ -517,20 +579,20 @@ impl BTree {
         }
     }
 
-    fn insert(&mut self, id: PageId, key: &[u8], value: &[u8], overflow: bool) -> Result<Option<Split>> {
+    fn insert(&mut self, id: PageId, ins: &Insert) -> Result<Option<Split>> {
         let r = self.pager.get(id)?;
         let n = Node(self.pager.page(r));
         match n.kind() {
             Ok(Kind::Leaf) => {
-                let res = self.insert_into_leaf(r, key, value, overflow);
+                let res = self.insert_into_leaf(r, ins);
                 self.pager.release(r);
                 res
             }
             Ok(Kind::Internal) => {
-                let ci = n.child_index(key);
+                let ci = n.child_index(ins.key);
                 let child = n.child(ci);
                 self.pager.release(r);
-                let Some(split) = self.insert(child, key, value, overflow)? else {
+                let Some(split) = self.insert(child, ins)? else {
                     return Ok(None);
                 };
                 let r = self.pager.get(id)?;
@@ -545,10 +607,15 @@ impl BTree {
         }
     }
 
-    fn insert_into_leaf(&mut self, r: PageRef, key: &[u8], value: &[u8], overflow: bool) -> Result<Option<Split>> {
+    fn insert_into_leaf(&mut self, r: PageRef, ins: &Insert) -> Result<Option<Split>> {
+        let Insert { key, value, overflow, .. } = *ins;
         let n = Node(self.pager.page(r));
         let (pos, found) = n.lower_bound(key);
         if found {
+            self.existed = true;
+            if !ins.replace {
+                return Ok(None);
+            }
             self.orphan = n.overflow(pos).map(|(_, first)| first);
         }
         let mut n = NodeMut(self.pager.page_mut(r));
@@ -762,6 +829,42 @@ mod tests {
         let mut t = open(dir.path(), false);
         let expected: Vec<_> = model.into_iter().collect();
         assert_eq!(scan_all(&mut t), expected);
+    }
+
+    #[test]
+    fn compare_matches_slice_order() {
+        let mut rng = Rng::new(3);
+        for _ in 0..20_000 {
+            let a = random_bytes(&mut rng, 24);
+            let mut b = a.clone();
+            match rng.below(3) {
+                0 => b = random_bytes(&mut rng, 24),
+                1 if !b.is_empty() => {
+                    let i = rng.below(b.len() as u64) as usize;
+                    b[i] = b[i].wrapping_add(rng.below(3) as u8);
+                }
+                _ => b.truncate(rng.below(b.len() as u64 + 1) as usize),
+            }
+            assert_eq!(compare(&a, &b), a.cmp(&b), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn put_if_absent_keeps_existing_values() {
+        let dir = TempDir::new();
+        let mut t = open(dir.path(), true);
+        for i in 0u32..2_000 {
+            assert!(t.put_if_absent(&i.to_be_bytes(), b"first").unwrap());
+        }
+        for i in 0u32..2_000 {
+            assert!(!t.put_if_absent(&i.to_be_bytes(), b"second").unwrap());
+        }
+        assert!(!t.put_if_absent(&7u32.to_be_bytes(), &vec![0u8; 10_000]).unwrap());
+        let pages = t.pager().page_count();
+        assert!(scan_all(&mut t).iter().all(|(_, v)| v == b"first"));
+        assert!(t.put_if_absent(b"big", &vec![9u8; 10_000]).unwrap());
+        assert_eq!(t.get(b"big").unwrap().unwrap(), vec![9u8; 10_000]);
+        assert!(t.pager().page_count() > pages);
     }
 
     #[test]

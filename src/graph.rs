@@ -25,13 +25,14 @@
 //! TODO: block-compressed adjacency lists; streaming iterators for very
 //! high-degree nodes; a query language.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
 use crate::btree::BTree;
 use crate::error::{Error, Result};
+use crate::hash::{IdMap, IdSet};
 use crate::pager::{NULL_PAGE, Options, Pager, Stats};
 use crate::value::Value;
 
@@ -136,6 +137,9 @@ pub struct Db {
     sym_ids: HashMap<(Sym, String), u32>,
     sym_names: HashMap<(Sym, u32), String>,
     indexed: Option<HashSet<u32>>,
+    /// Counter values, written back to the tree at commit; cleared on rollback.
+    counters: HashMap<&'static [u8], u64>,
+    counters_dirty: bool,
 }
 
 impl Db {
@@ -168,11 +172,24 @@ impl Db {
         } else {
             BTree::open(pager)?
         };
-        Ok(Db { tree, sym_ids: HashMap::new(), sym_names: HashMap::new(), indexed: None })
+        Ok(Db {
+            tree,
+            sym_ids: HashMap::new(),
+            sym_names: HashMap::new(),
+            indexed: None,
+            counters: HashMap::new(),
+            counters_dirty: false,
+        })
     }
 
     /// Atomically and durably applies every change since the last commit.
     pub fn commit(&mut self) -> Result<()> {
+        if self.counters_dirty {
+            for (name, v) in &self.counters {
+                self.tree.put(&Key::new(META).bytes(name), &v.to_be_bytes())?;
+            }
+            self.counters_dirty = false;
+        }
         self.tree.pager_mut().commit()
     }
 
@@ -182,6 +199,8 @@ impl Db {
         self.sym_ids.clear();
         self.sym_names.clear();
         self.indexed = None;
+        self.counters.clear();
+        self.counters_dirty = false;
     }
 
     /// Runs `f`, then commits if it returns `Ok` or rolls back if it returns
@@ -272,11 +291,9 @@ impl Db {
     pub fn add_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
         self.require_node(id)?;
         let l = self.intern(Sym::Label, label)?;
-        let key = Key::new(NODE_LABEL).u64(id).u32(l);
-        if self.tree.contains(&key)? {
+        if !self.tree.put_if_absent(&Key::new(NODE_LABEL).u64(id).u32(l), &[])? {
             return Ok(false);
         }
-        self.tree.put(&key, &[])?;
         self.tree.put(&Key::new(LABEL_INDEX).u32(l).u64(id), &[])?;
         Ok(true)
     }
@@ -311,7 +328,12 @@ impl Db {
         let Some(l) = self.symbol(Sym::Label, label)? else {
             return Ok(Vec::new());
         };
-        self.scan_keys(&Key::new(LABEL_INDEX).u32(l))?.iter().map(|k| be_u64(k, 5)).collect()
+        let mut out = Vec::new();
+        self.for_each_key(&Key::new(LABEL_INDEX).u32(l), |k| {
+            out.push(be_u64(k, 5)?);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     // ---- node properties ----
@@ -426,13 +448,13 @@ impl Db {
     /// existed; there is at most one edge per (src, type, dst).
     pub fn add_edge(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
         self.require_node(src)?;
-        self.require_node(dst)?;
+        if dst != src {
+            self.require_node(dst)?;
+        }
         let t = self.intern(Sym::EdgeType, edge_type)?;
-        let out = Key::new(OUT).u64(src).u32(t).u64(dst);
-        if self.tree.contains(&out)? {
+        if !self.tree.put_if_absent(&Key::new(OUT).u64(src).u32(t).u64(dst), &[])? {
             return Ok(false);
         }
-        self.tree.put(&out, &[])?;
         self.tree.put(&Key::new(IN).u64(dst).u32(t).u64(src), &[])?;
         self.bump(EDGE_COUNT, 1)?;
         Ok(true)
@@ -485,11 +507,13 @@ impl Db {
             return Ok(0);
         };
         let mut n = 0;
-        if dir != Direction::In {
-            n += self.scan_keys(&Key::new(OUT).u64(id).u32(t))?.len() as u64;
-        }
-        if dir != Direction::Out {
-            n += self.scan_keys(&Key::new(IN).u64(id).u32(t))?.len() as u64;
+        for (tag, wanted) in [(OUT, dir != Direction::In), (IN, dir != Direction::Out)] {
+            if wanted {
+                self.for_each_key(&Key::new(tag).u64(id).u32(t), |_| {
+                    n += 1;
+                    Ok(())
+                })?;
+            }
         }
         Ok(n)
     }
@@ -587,8 +611,10 @@ impl Db {
         let Some(t) = self.edge_filter(edge_type)? else {
             return Ok(vec![(start, 0)]);
         };
-        let mut seen = HashSet::from([start]);
+        let mut seen = IdSet::default();
+        seen.insert(start);
         let mut out = vec![(start, 0)];
+        let mut next = Vec::new();
         let mut i = 0;
         while i < out.len() {
             let (node, depth) = out[i];
@@ -596,9 +622,11 @@ impl Db {
             if depth == max_depth {
                 continue;
             }
-            for next in self.step(node, t, dir)? {
-                if seen.insert(next) {
-                    out.push((next, depth + 1));
+            next.clear();
+            self.step_into(node, t, dir, &mut next)?;
+            for &n in &next {
+                if seen.insert(n) {
+                    out.push((n, depth + 1));
                 }
             }
         }
@@ -608,6 +636,9 @@ impl Db {
     /// A shortest path from `from` to `to` over edges of `edge_type` (any
     /// type if `None`), as the list of nodes along it, or `None` if `to` is
     /// unreachable.
+    ///
+    /// Searches from both ends, always expanding the smaller frontier by one
+    /// level, so it visits far fewer nodes than a one-sided search.
     pub fn shortest_path(
         &mut self,
         from: NodeId,
@@ -623,26 +654,61 @@ impl Db {
         let Some(t) = self.edge_filter(edge_type)? else {
             return Ok(None);
         };
-        let mut parent = HashMap::from([(from, from)]);
-        let mut queue = VecDeque::from([from]);
-        while let Some(node) = queue.pop_front() {
-            for next in self.step(node, t, dir)? {
-                if parent.contains_key(&next) {
-                    continue;
-                }
-                parent.insert(next, node);
-                if next == to {
-                    let mut path = vec![to];
-                    let mut cur = to;
-                    while cur != from {
-                        cur = parent[&cur];
-                        path.push(cur);
+        let back_dir = match dir {
+            Direction::Out => Direction::In,
+            Direction::In => Direction::Out,
+            Direction::Both => Direction::Both,
+        };
+        // Each side maps visited nodes to (parent toward its root, depth).
+        let mut sides = [IdMap::default(), IdMap::default()];
+        sides[0].insert(from, (from, 0u32));
+        sides[1].insert(to, (to, 0u32));
+        let mut frontiers = [vec![from], vec![to]];
+        let mut next = Vec::new();
+        let mut neighbors = Vec::new();
+        while !frontiers[0].is_empty() && !frontiers[1].is_empty() {
+            let side = usize::from(frontiers[1].len() < frontiers[0].len());
+            let d = if side == 0 { dir } else { back_dir };
+            // The best meeting found while expanding this level: (length, u, v)
+            // for an edge from u on this side to v already seen by the other.
+            let mut best: Option<(u32, NodeId, NodeId)> = None;
+            next.clear();
+            for &u in &frontiers[side] {
+                let du = sides[side][&u].1;
+                neighbors.clear();
+                self.step_into(u, t, d, &mut neighbors)?;
+                for &v in &neighbors {
+                    if let Some(&(_, dv)) = sides[1 - side].get(&v)
+                        && best.is_none_or(|(len, _, _)| du + 1 + dv < len)
+                    {
+                        best = Some((du + 1 + dv, u, v));
                     }
-                    path.reverse();
-                    return Ok(Some(path));
+                    if let std::collections::hash_map::Entry::Vacant(e) = sides[side].entry(v) {
+                        e.insert((u, du + 1));
+                        next.push(v);
+                    }
                 }
-                queue.push_back(next);
             }
+            if let Some((_, u, v)) = best {
+                // Walk u back to this side's root and v back to the other's.
+                let chain = |map: &IdMap<(NodeId, u32)>, mut n: NodeId| {
+                    let mut c = vec![n];
+                    while map[&n].0 != n {
+                        n = map[&n].0;
+                        c.push(n);
+                    }
+                    c
+                };
+                let (mut path, tail) = if side == 0 {
+                    (chain(&sides[0], u), chain(&sides[1], v))
+                } else {
+                    (chain(&sides[0], v), chain(&sides[1], u))
+                };
+                path.reverse();
+                path.extend(tail);
+                return Ok(Some(path));
+            }
+            std::mem::swap(&mut frontiers[side], &mut next);
         }
         Ok(None)
     }
@@ -658,21 +724,37 @@ impl Db {
     /// Distinct neighbors of `id` over type `t` (any if `None`), in id order.
     fn step(&mut self, id: NodeId, t: Option<u32>, dir: Direction) -> Result<Vec<NodeId>> {
         let mut out = Vec::new();
+        self.step_into(id, t, dir, &mut out)?;
+        if dir == Direction::Both || t.is_none() {
+            out.sort_unstable();
+            out.dedup();
+        }
+        Ok(out)
+    }
+
+    /// Appends the neighbors of `id` over type `t` (any if `None`) to `out`,
+    /// unsorted and possibly repeated.
+    fn step_into(&mut self, id: NodeId, t: Option<u32>, dir: Direction, out: &mut Vec<NodeId>) -> Result<()> {
         for (tag, wanted) in [(OUT, dir != Direction::In), (IN, dir != Direction::Out)] {
             if !wanted {
                 continue;
             }
-            let prefix = match t {
-                Some(t) => Key::new(tag).u64(id).u32(t),
-                None => Key::new(tag).u64(id),
+            let mut prefix = [0u8; 13];
+            prefix[0] = tag;
+            prefix[1..9].copy_from_slice(&id.to_be_bytes());
+            let len = match t {
+                Some(t) => {
+                    prefix[9..13].copy_from_slice(&t.to_be_bytes());
+                    13
+                }
+                None => 9,
             };
-            for k in self.scan_keys(&prefix)? {
-                out.push(be_u64(&k, 13)?);
-            }
+            self.for_each_key(&prefix[..len], |k| {
+                out.push(be_u64(k, 13)?);
+                Ok(())
+            })?;
         }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Ok(())
     }
 
     // ---- internals ----
@@ -694,6 +776,18 @@ impl Db {
         Ok(out)
     }
 
+    /// Calls `f` on every key starting with `prefix`, without copying keys.
+    fn for_each_key(&mut self, prefix: &[u8], mut f: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut c = self.tree.seek(prefix)?;
+        while let Some((k, _)) = c.next()? {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            f(k)?;
+        }
+        Ok(())
+    }
+
     fn scan_keys(&mut self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut c = self.tree.seek(prefix)?;
         let mut out = Vec::new();
@@ -706,18 +800,25 @@ impl Db {
         Ok(out)
     }
 
-    fn counter(&mut self, name: &[u8]) -> Result<u64> {
-        match self.tree.get(&Key::new(META).bytes(name))? {
-            Some(v) => Ok(u64::from_be_bytes(v.try_into().map_err(|_| Error::Corrupt("bad counter"))?)),
-            None => Ok(0),
+    fn counter(&mut self, name: &'static [u8]) -> Result<u64> {
+        if let Some(&v) = self.counters.get(name) {
+            return Ok(v);
         }
+        let v = match self.tree.get(&Key::new(META).bytes(name))? {
+            Some(v) => u64::from_be_bytes(v.try_into().map_err(|_| Error::Corrupt("bad counter"))?),
+            None => 0,
+        };
+        self.counters.insert(name, v);
+        Ok(v)
     }
 
-    fn set_counter(&mut self, name: &[u8], v: u64) -> Result<()> {
-        self.tree.put(&Key::new(META).bytes(name), &v.to_be_bytes())
+    fn set_counter(&mut self, name: &'static [u8], v: u64) -> Result<()> {
+        self.counters.insert(name, v);
+        self.counters_dirty = true;
+        Ok(())
     }
 
-    fn bump(&mut self, name: &[u8], delta: i64) -> Result<()> {
+    fn bump(&mut self, name: &'static [u8], delta: i64) -> Result<()> {
         let v = self.counter(name)?;
         self.set_counter(name, v.wrapping_add_signed(delta))
     }
