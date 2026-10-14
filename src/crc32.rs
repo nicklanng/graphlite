@@ -21,11 +21,28 @@ const fn make_table() -> [u32; 256] {
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c = TABLE[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
+    let mut h = Hasher::new();
+    h.update(data);
+    h.finish()
+}
+
+/// Incremental CRC-32 over several slices.
+pub struct Hasher(u32);
+
+impl Hasher {
+    pub fn new() -> Hasher {
+        Hasher(!0)
     }
-    !c
+
+    pub fn update(&mut self, data: &[u8]) {
+        for &b in data {
+            self.0 = TABLE[((self.0 ^ b as u32) & 0xff) as usize] ^ (self.0 >> 8);
+        }
+    }
+
+    pub fn finish(&self) -> u32 {
+        !self.0
+    }
 }
 
 #[cfg(test)]
@@ -33,5 +50,9 @@ mod tests {
     #[test]
     fn check_value() {
         assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+        let mut h = super::Hasher::new();
+        h.update(b"1234");
+        h.update(b"56789");
+        assert_eq!(h.finish(), 0xCBF4_3926);
     }
 }

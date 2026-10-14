@@ -12,10 +12,12 @@ pub enum Error {
     InvalidPageSize(u32),
     /// Every frame in the buffer pool is pinned.
     PoolExhausted,
-    /// A key/value pair exceeds the largest cell a page can hold.
+    /// A key, name, or indexed value is too long to fit in a page.
     TooLarge,
     /// Another handle holds the database file lock.
     Locked,
+    NodeNotFound(u64),
+    EdgeNotFound,
 }
 
 impl fmt::Display for Error {
@@ -26,8 +28,10 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => write!(f, "unsupported file format version {v}"),
             Error::InvalidPageSize(s) => write!(f, "invalid page size {s}"),
             Error::PoolExhausted => f.write_str("buffer pool exhausted: all pages pinned"),
-            Error::TooLarge => f.write_str("key/value pair too large for a page"),
+            Error::TooLarge => f.write_str("key, name, or indexed value too large for a page"),
             Error::Locked => f.write_str("database is locked by another handle"),
+            Error::NodeNotFound(id) => write!(f, "node {id} does not exist"),
+            Error::EdgeNotFound => f.write_str("edge does not exist"),
         }
     }
 }

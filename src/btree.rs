@@ -17,9 +17,14 @@
 //! The root page id never changes: a root split moves the old root's
 //! contents to a fresh page.
 //!
+//! Values too large to fit inline (keys + values beyond about a quarter page)
+//! go to a chain of overflow pages; the leaf cell then stores vlen = 0xFFFF
+//! and a 16-byte stub: total length u64 | first page u64. Each overflow page
+//! is: next page u64 | data.
+//!
 //! TODO: deletes don't rebalance (underfull and empty leaves are tolerated
-//! and skipped by cursors); no overflow pages, so a cell is capped at about a
-//! quarter page; no prefix compression yet.
+//! and skipped by cursors); keys are capped at about a quarter page; no
+//! prefix compression yet.
 
 use std::cmp::Ordering;
 
@@ -33,6 +38,8 @@ const HEADER_SIZE: usize = 16;
 const SLOT_SIZE: usize = 2;
 const LEAF_OVERHEAD: usize = 4;
 const INTERNAL_OVERHEAD: usize = 10;
+const OVERFLOW_MARK: usize = 0xFFFF;
+const STUB_SIZE: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -88,12 +95,28 @@ impl<'a> Node<'a> {
         &self.0[start..start + klen]
     }
 
-    fn value(self, i: usize) -> &'a [u8] {
+    /// The value bytes as stored in the cell: the value, or an overflow stub.
+    fn stored(self, i: usize) -> &'a [u8] {
         debug_assert!(self.is_leaf());
         let off = self.slot(i);
         let (klen, vlen) = (self.u16_at(off), self.u16_at(off + 2));
+        let len = if vlen == OVERFLOW_MARK { STUB_SIZE } else { vlen };
         let start = off + LEAF_OVERHEAD + klen;
-        &self.0[start..start + vlen]
+        &self.0[start..start + len]
+    }
+
+    fn is_overflow(self, i: usize) -> bool {
+        self.u16_at(self.slot(i) + 2) == OVERFLOW_MARK
+    }
+
+    /// Total length and first page of an overflowed value.
+    fn overflow(self, i: usize) -> Option<(usize, PageId)> {
+        if !self.is_overflow(i) {
+            return None;
+        }
+        let stub = self.stored(i);
+        let len = u64::from_le_bytes(stub[0..8].try_into().unwrap()) as usize;
+        Some((len, u64::from_le_bytes(stub[8..16].try_into().unwrap())))
     }
 
     /// Child pointer `i`; `i == count` is the rightmost child.
@@ -106,7 +129,7 @@ impl<'a> Node<'a> {
         let off = self.slot(i);
         let klen = self.u16_at(off);
         if self.is_leaf() {
-            LEAF_OVERHEAD + klen + self.u16_at(off + 2)
+            LEAF_OVERHEAD + klen + self.stored(i).len()
         } else {
             INTERNAL_OVERHEAD + klen
         }
@@ -215,10 +238,12 @@ impl<'a> NodeMut<'a> {
         off
     }
 
-    fn put_leaf_cell(&mut self, i: usize, key: &[u8], value: &[u8]) {
+    /// Writes a leaf cell; with `overflow`, `value` is a 16-byte stub.
+    fn put_leaf_cell(&mut self, i: usize, key: &[u8], value: &[u8], overflow: bool) {
+        debug_assert!(!overflow || value.len() == STUB_SIZE);
         let off = self.reserve(i, LEAF_OVERHEAD + key.len() + value.len());
         self.set_u16(off, key.len());
-        self.set_u16(off + 2, value.len());
+        self.set_u16(off + 2, if overflow { OVERFLOW_MARK } else { value.len() });
         let k = off + LEAF_OVERHEAD;
         self.0[k..k + key.len()].copy_from_slice(key);
         self.0[k + key.len()..k + key.len() + value.len()].copy_from_slice(value);
@@ -262,6 +287,7 @@ impl<'a> NodeMut<'a> {
 struct Cell<'a> {
     key: &'a [u8],
     value: &'a [u8],
+    overflow: bool,
     child: PageId,
 }
 
@@ -303,6 +329,8 @@ pub struct BTree {
     /// Largest cell (header + key + value) a page may hold; at least four
     /// fit per page, which keeps splits balanced.
     max_cell: usize,
+    /// Overflow chain of a value replaced during an insert, freed afterwards.
+    orphan: Option<PageId>,
 }
 
 impl BTree {
@@ -329,6 +357,7 @@ impl BTree {
         BTree {
             scratch: vec![0u8; usable],
             max_cell: (usable - HEADER_SIZE) / 4 - SLOT_SIZE,
+            orphan: None,
             pager,
             root,
         }
@@ -342,20 +371,30 @@ impl BTree {
         &mut self.pager
     }
 
-    /// Largest `key.len() + value.len()` accepted by [`BTree::put`].
-    pub fn max_entry_len(&self) -> usize {
+    /// Largest `key.len() + value.len()` stored inline in a leaf.
+    fn max_inline(&self) -> usize {
         self.max_cell - INTERNAL_OVERHEAD
+    }
+
+    /// Longest key accepted by [`BTree::put`].
+    pub fn max_key_len(&self) -> usize {
+        self.max_inline() - STUB_SIZE
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let r = self.find_leaf(key)?;
         let n = Node(self.pager.page(r));
-        let out = match n.lower_bound(key) {
-            (i, true) => Some(n.value(i).to_vec()),
-            _ => None,
+        let (i, found) = n.lower_bound(key);
+        let out = if !found {
+            Ok(None)
+        } else if let Some((len, first)) = n.overflow(i) {
+            let mut v = Vec::new();
+            read_overflow(&mut self.pager, len, first, &mut v).map(|()| Some(v))
+        } else {
+            Ok(Some(n.stored(i).to_vec()))
         };
         self.pager.release(r);
-        Ok(out)
+        out
     }
 
     pub fn contains(&mut self, key: &[u8]) -> Result<bool> {
@@ -365,12 +404,25 @@ impl BTree {
         Ok(found)
     }
 
-    /// Inserts or replaces `key`.
+    /// Inserts or replaces `key`. Values of any size are accepted; keys are
+    /// limited to [`BTree::max_key_len`].
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        if key.len() + value.len() > self.max_entry_len() {
+        if key.len() > self.max_key_len() {
             return Err(Error::TooLarge);
         }
-        let Some(split) = self.insert(self.root, key, value)? else {
+        let stub;
+        let (stored, overflow) = if key.len() + value.len() <= self.max_inline() {
+            (value, false)
+        } else {
+            let first = self.write_overflow(value)?;
+            stub = [(value.len() as u64).to_le_bytes(), first.to_le_bytes()].concat();
+            (&stub[..], true)
+        };
+        let split = self.insert(self.root, key, stored, overflow)?;
+        if let Some(first) = self.orphan.take() {
+            self.free_overflow(first)?;
+        }
+        let Some(split) = split else {
             return Ok(());
         };
         // Keep the root id stable: move its contents to a new left child.
@@ -396,11 +448,17 @@ impl BTree {
     /// Removes `key`, returning whether it was present.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let r = self.find_leaf(key)?;
-        let (i, found) = Node(self.pager.page(r)).lower_bound(key);
+        let n = Node(self.pager.page(r));
+        let (i, found) = n.lower_bound(key);
+        let mut chain = None;
         if found {
+            chain = n.overflow(i).map(|(_, first)| first);
             NodeMut(self.pager.page_mut(r)).remove(i);
         }
         self.pager.release(r);
+        if let Some(first) = chain {
+            self.free_overflow(first)?;
+        }
         Ok(found)
     }
 
@@ -409,7 +467,34 @@ impl BTree {
     pub fn seek(&mut self, key: &[u8]) -> Result<Cursor<'_>> {
         let r = self.find_leaf(key)?;
         let (idx, _) = Node(self.pager.page(r)).lower_bound(key);
-        Ok(Cursor { pager: &mut self.pager, page: Some(r), idx })
+        Ok(Cursor { pager: &mut self.pager, page: Some(r), idx, buf: Vec::new() })
+    }
+
+    /// Writes `value` to a new overflow chain, returning its first page.
+    fn write_overflow(&mut self, value: &[u8]) -> Result<PageId> {
+        let cap = self.pager.usable_size() - 8;
+        let mut next = NULL_PAGE;
+        // Back to front, so each page can link to the one written before it.
+        for chunk in value.chunks(cap).rev() {
+            let r = self.pager.allocate()?;
+            let page = self.pager.page_mut(r);
+            page[0..8].copy_from_slice(&next.to_le_bytes());
+            page[8..8 + chunk.len()].copy_from_slice(chunk);
+            next = self.pager.id(r);
+            self.pager.release(r);
+        }
+        Ok(next)
+    }
+
+    fn free_overflow(&mut self, mut id: PageId) -> Result<()> {
+        while id != NULL_PAGE {
+            let r = self.pager.get(id)?;
+            let next = u64::from_le_bytes(self.pager.page(r)[0..8].try_into().unwrap());
+            self.pager.release(r);
+            self.pager.free(id)?;
+            id = next;
+        }
+        Ok(())
     }
 
     /// Descends to the leaf that may contain `key` and returns it pinned.
@@ -432,12 +517,12 @@ impl BTree {
         }
     }
 
-    fn insert(&mut self, id: PageId, key: &[u8], value: &[u8]) -> Result<Option<Split>> {
+    fn insert(&mut self, id: PageId, key: &[u8], value: &[u8], overflow: bool) -> Result<Option<Split>> {
         let r = self.pager.get(id)?;
         let n = Node(self.pager.page(r));
         match n.kind() {
             Ok(Kind::Leaf) => {
-                let res = self.insert_into_leaf(r, key, value);
+                let res = self.insert_into_leaf(r, key, value, overflow);
                 self.pager.release(r);
                 res
             }
@@ -445,7 +530,7 @@ impl BTree {
                 let ci = n.child_index(key);
                 let child = n.child(ci);
                 self.pager.release(r);
-                let Some(split) = self.insert(child, key, value)? else {
+                let Some(split) = self.insert(child, key, value, overflow)? else {
                     return Ok(None);
                 };
                 let r = self.pager.get(id)?;
@@ -460,22 +545,27 @@ impl BTree {
         }
     }
 
-    fn insert_into_leaf(&mut self, r: PageRef, key: &[u8], value: &[u8]) -> Result<Option<Split>> {
-        let (pos, found) = Node(self.pager.page(r)).lower_bound(key);
+    fn insert_into_leaf(&mut self, r: PageRef, key: &[u8], value: &[u8], overflow: bool) -> Result<Option<Split>> {
+        let n = Node(self.pager.page(r));
+        let (pos, found) = n.lower_bound(key);
+        if found {
+            self.orphan = n.overflow(pos).map(|(_, first)| first);
+        }
         let mut n = NodeMut(self.pager.page_mut(r));
         if found {
             n.remove(pos);
         }
         if n.make_room(LEAF_OVERHEAD + key.len() + value.len(), &mut self.scratch) {
-            n.put_leaf_cell(pos, key, value);
+            n.put_leaf_cell(pos, key, value, overflow);
             return Ok(None);
         }
 
         self.scratch.copy_from_slice(self.pager.page(r));
         let old = Node(&self.scratch);
-        let mut cells: Vec<Cell> =
-            (0..old.count()).map(|i| Cell { key: old.key(i), value: old.value(i), child: NULL_PAGE }).collect();
-        cells.insert(pos, Cell { key, value, child: NULL_PAGE });
+        let mut cells: Vec<Cell> = (0..old.count())
+            .map(|i| Cell { key: old.key(i), value: old.stored(i), overflow: old.is_overflow(i), child: NULL_PAGE })
+            .collect();
+        cells.insert(pos, Cell { key, value, overflow, child: NULL_PAGE });
         let m = split_point(&cells, Kind::Leaf);
         let sep = cells[m].key.to_vec();
 
@@ -484,14 +574,14 @@ impl BTree {
         let mut rn = NodeMut::init(self.pager.page_mut(right), Kind::Leaf);
         rn.set_link(old.link());
         for (i, c) in cells[m..].iter().enumerate() {
-            rn.put_leaf_cell(i, c.key, c.value);
+            rn.put_leaf_cell(i, c.key, c.value, c.overflow);
         }
         self.pager.release(right);
 
         let mut ln = NodeMut::init(self.pager.page_mut(r), Kind::Leaf);
         ln.set_link(right_id);
         for (i, c) in cells[..m].iter().enumerate() {
-            ln.put_leaf_cell(i, c.key, c.value);
+            ln.put_leaf_cell(i, c.key, c.value, c.overflow);
         }
         Ok(Some(Split { key: sep, right: right_id }))
     }
@@ -509,9 +599,9 @@ impl BTree {
         self.scratch.copy_from_slice(self.pager.page(r));
         let old = Node(&self.scratch);
         let mut cells: Vec<Cell> =
-            (0..old.count()).map(|i| Cell { key: old.key(i), value: &[], child: old.child(i) }).collect();
+            (0..old.count()).map(|i| Cell { key: old.key(i), value: &[], overflow: false, child: old.child(i) }).collect();
         let mut rightmost = old.link();
-        cells.insert(ci, Cell { key: &split.key, value: &[], child: left });
+        cells.insert(ci, Cell { key: &split.key, value: &[], overflow: false, child: left });
         // The pointer that used to lead to `left` now leads to `split.right`.
         match cells.get_mut(ci + 1) {
             Some(c) => c.child = split.right,
@@ -543,6 +633,8 @@ pub struct Cursor<'t> {
     pager: &'t mut Pager,
     page: Option<PageRef>,
     idx: usize,
+    /// Holds the current value when it lives in overflow pages.
+    buf: Vec<u8>,
 }
 
 impl Cursor<'_> {
@@ -555,8 +647,12 @@ impl Cursor<'_> {
             if self.idx < count {
                 let i = self.idx;
                 self.idx += 1;
+                if let Some((len, first)) = Node(self.pager.page(r)).overflow(i) {
+                    read_overflow(self.pager, len, first, &mut self.buf)?;
+                    return Ok(Some((Node(self.pager.page(r)).key(i), &self.buf)));
+                }
                 let n = Node(self.pager.page(r));
-                return Ok(Some((n.key(i), n.value(i))));
+                return Ok(Some((n.key(i), n.stored(i))));
             }
             let sibling = Node(self.pager.page(r)).link();
             self.pager.release(r);
@@ -568,6 +664,24 @@ impl Cursor<'_> {
         }
         Ok(None)
     }
+}
+
+/// Reads an overflowed value of `len` bytes starting at page `id` into `out`.
+fn read_overflow(pager: &mut Pager, len: usize, mut id: PageId, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    out.reserve(len);
+    while out.len() < len {
+        if id == NULL_PAGE {
+            return Err(Error::Corrupt("overflow chain too short"));
+        }
+        let r = pager.get(id)?;
+        let page = pager.page(r);
+        let take = (len - out.len()).min(page.len() - 8);
+        out.extend_from_slice(&page[8..8 + take]);
+        id = u64::from_le_bytes(page[0..8].try_into().unwrap());
+        pager.release(r);
+    }
+    Ok(())
 }
 
 impl Drop for Cursor<'_> {
@@ -587,13 +701,15 @@ mod tests {
     use std::fs::OpenOptions;
     use std::path::Path;
 
-    fn open(path: &Path, create: bool) -> BTree {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).unwrap();
-        let opts = Options { page_size: 512, cache_pages: 16 };
+    fn open(dir: &Path, create: bool) -> BTree {
+        let file = |name: &str| {
+            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(name)).unwrap()
+        };
+        let opts = Options { page_size: 512, cache_pages: 16, wal_autocheckpoint: 64 };
         if create {
-            BTree::create(Pager::create(file, &opts).unwrap()).unwrap()
+            BTree::create(Pager::create(file("t.db"), file("t.db-wal"), &opts).unwrap()).unwrap()
         } else {
-            BTree::open(Pager::open(file, &opts).unwrap()).unwrap()
+            BTree::open(Pager::open(file("t.db"), file("t.db-wal"), &opts).unwrap()).unwrap()
         }
     }
 
@@ -615,8 +731,7 @@ mod tests {
     #[test]
     fn matches_reference_model() {
         let dir = TempDir::new();
-        let path = dir.path().join("t.db");
-        let mut t = open(&path, true);
+        let mut t = open(dir.path(), true);
         let mut model = BTreeMap::new();
         let mut rng = Rng::new(7);
 
@@ -624,12 +739,17 @@ mod tests {
             let key = random_bytes(&mut rng, 12);
             match rng.below(10) {
                 0..=6 => {
-                    let value = random_bytes(&mut rng, 40);
+                    // Mostly small values, some spilling into overflow pages.
+                    let max = if rng.below(20) == 0 { 2_000 } else { 40 };
+                    let value = random_bytes(&mut rng, max);
                     t.put(&key, &value).unwrap();
                     model.insert(key, value);
                 }
                 7..=8 => assert_eq!(t.delete(&key).unwrap(), model.remove(&key).is_some()),
                 _ => assert_eq!(t.get(&key).unwrap(), model.get(&key).cloned()),
+            }
+            if step % 1_000 == 0 {
+                t.pager_mut().commit().unwrap();
             }
             if step % 5_000 == 0 {
                 let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -637,9 +757,9 @@ mod tests {
             }
         }
 
-        t.pager_mut().flush().unwrap();
+        t.pager_mut().commit().unwrap();
         drop(t);
-        let mut t = open(&path, false);
+        let mut t = open(dir.path(), false);
         let expected: Vec<_> = model.into_iter().collect();
         assert_eq!(scan_all(&mut t), expected);
     }
@@ -647,7 +767,7 @@ mod tests {
     #[test]
     fn sequential_inserts_and_seek() {
         let dir = TempDir::new();
-        let mut t = open(&dir.path().join("t.db"), true);
+        let mut t = open(dir.path(), true);
         for i in 0u32..10_000 {
             t.put(&i.to_be_bytes(), &(i * 2).to_le_bytes()).unwrap();
         }
@@ -661,18 +781,42 @@ mod tests {
     }
 
     #[test]
-    fn oversized_entries_are_rejected() {
+    fn oversized_keys_are_rejected() {
         let dir = TempDir::new();
-        let mut t = open(&dir.path().join("t.db"), true);
-        let max = t.max_entry_len();
-        t.put(&vec![1u8; max], &[]).unwrap();
+        let mut t = open(dir.path(), true);
+        let max = t.max_key_len();
         assert!(matches!(t.put(&vec![2u8; max + 1], &[]), Err(Error::TooLarge)));
-        // Max-size keys still split cleanly.
+        // Max-size keys with large values still split cleanly.
         for i in 0..50u8 {
             let mut k = vec![i; max - 1];
             k.push(0);
-            t.put(&k, &[]).unwrap();
+            t.put(&k, &vec![i; 1_000]).unwrap();
         }
-        assert_eq!(scan_all(&mut t).len(), 51);
+        let all = scan_all(&mut t);
+        assert_eq!(all.len(), 50);
+        assert!(all.iter().enumerate().all(|(i, (_, v))| *v == vec![i as u8; 1_000]));
+    }
+
+    #[test]
+    fn overflow_values_roundtrip_and_free_their_pages() {
+        let dir = TempDir::new();
+        let mut t = open(dir.path(), true);
+        let cap = t.pager().usable_size() - 8;
+        for len in [cap - 1, cap, cap + 1, 3 * cap, 100_000] {
+            let v: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            t.put(b"big", &v).unwrap();
+            assert_eq!(t.get(b"big").unwrap().unwrap(), v);
+        }
+        t.put(b"big", &vec![1u8; 100_000]).unwrap();
+        let pages = t.pager().page_count();
+        for _ in 0..5 {
+            t.put(b"big", &vec![2u8; 100_000]).unwrap();
+        }
+        assert_eq!(t.pager().page_count(), pages, "replaced chains should be reused");
+        t.put(b"big", b"small").unwrap();
+        assert_eq!(t.get(b"big").unwrap().unwrap(), b"small");
+        assert!(t.delete(b"big").unwrap());
+        t.put(b"again", &vec![3u8; 100_000]).unwrap();
+        assert_eq!(t.pager().page_count(), pages);
     }
 }
