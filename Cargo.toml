@@ -1,0 +1,12 @@
+[package]
+name = "graphlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89" # File::try_lock
+description = "An embedded, single-file graph database"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[profile.release]
+debug = true # keep symbols for profiling
