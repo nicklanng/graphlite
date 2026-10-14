@@ -35,11 +35,16 @@ for friend in db.neighbors(alice, "KNOWS", Direction::Out)? {
 - **Transactions**: every change since the last commit forms one atomic,
   durable unit. You get `commit`, `rollback`, and `transaction(|db| …)`,
   which commits on `Ok` and rolls back on `Err`. Dropping the `Db` discards
-  uncommitted changes.
+  uncommitted changes. A write that fails partway, such as an I/O error in
+  the middle of `delete_node`, may leave the transaction half-applied. Writes
+  and commits then return `Error::RollbackRequired` until you roll back.
 - **Crash safety**: changes go to a write-ahead log (`<file>-wal`), and a
   commit is a single fsync. After a crash, the database reopens in exactly
-  the state of the last commit. Every page carries a CRC-32C, so corruption
-  surfaces as `Error::Corrupt` rather than as wrong data.
+  the state of the last commit. Each commit frame carries a checksum chained
+  over its whole transaction, so leftover frames from a transaction that
+  never committed can't be replayed. Every page carries a CRC-32C, and tree
+  pages are checked for structure when loaded, so a damaged file surfaces as
+  `Error::Corrupt` rather than as wrong data, a panic, or a hang.
 - **One process, one handle**: the file is locked while it's open. `Db` is
   `Send`; share it across threads behind a `Mutex`.
 
@@ -56,13 +61,16 @@ for friend in db.neighbors(alice, "KNOWS", Direction::Out)? {
 
 ## Tests
 
-`cargo test` runs 31 tests. The 16 unit tests cover each layer, including a
-randomized B+tree test against a reference `BTreeMap`. The 15 tests in
-`tests/api.rs` use only the public API and cover:
+`cargo test` runs 41 tests. The 23 unit tests cover each layer, including a
+randomized B+tree test against a reference `BTreeMap` and malformed tree
+pages. The 18 tests in `tests/api.rs` use only the public API and cover:
 
-- every API area, plus error cases
+- every API area, plus error cases, including failed writes that must
+  leave a usable, consistent transaction
 - crash recovery: the WAL is truncated at dozens of points, and every cut
   must reopen to a consistent, committed state
+- a torn commit, where every frame but the first reached disk, staying
+  aborted after a later, shorter commit overwrites part of it
 - trailing garbage in the WAL
 - page corruption
 - file locking
@@ -75,12 +83,15 @@ Run `graphlite bench <path> 2000000`, then
 `cargo run --release --example read_bench -- <path>`:
 
 ```
-load:   200000 nodes, 2000000 edges in 13.78s (145178 edges/s, commit every 100000)
+load:   200000 nodes, 2000000 edges in 12.87s (155455 edges/s, commit every 100000)
 size:   157.6 MiB (82.6 bytes/edge)
-neighbors:     1000000 in 1.15s (1.15 us each)
-2-hop traverse: 10000 in 151.97ms (15.20 us each, 110 nodes avg)
-shortest path: 1000 in 523.96ms (0.52 ms each, 5.4 nodes avg)
+neighbors:     1000000 in 1.30s (1.30 us each)
+2-hop traverse: 10000 in 168.61ms (16.86 us each, 110 nodes avg)
+shortest path: 1000 in 571.00ms (0.57 ms each, 5.4 nodes avg)
 ```
+
+Checking each tree page's structure when it's loaded costs about 8% on these
+reads, which miss the cache most of the time.
 
 A profiling pass with [samply](https://github.com/mstange/samply) gave these
 gains over the first version on the same workload:

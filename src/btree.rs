@@ -40,6 +40,9 @@ const LEAF_OVERHEAD: usize = 4;
 const INTERNAL_OVERHEAD: usize = 10;
 const OVERFLOW_MARK: usize = 0xFFFF;
 const STUB_SIZE: usize = 16;
+/// Deeper than any real tree: every internal node has at least two children.
+/// A descent this long means a cycle in a damaged file.
+const MAX_HEIGHT: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -197,6 +200,57 @@ fn compare(a: &[u8], b: &[u8]) -> Ordering {
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// Checks a node page loaded from disk, so the accessors above can't index
+/// out of bounds and splits can't overflow a page, even on a damaged file
+/// whose checksums are intact. Cells must fit in the page, each no larger
+/// than `max_cell`.
+fn check_node(page: &[u8], max_cell: usize) -> Result<()> {
+    let n = Node(page);
+    let (overhead, vlen_mask) = match n.kind()? {
+        Kind::Leaf => (LEAF_OVERHEAD, 0xFFFF),
+        Kind::Internal => (INTERNAL_OVERHEAD, 0),
+    };
+    let start = n.content_start();
+    let slots_end = HEADER_SIZE + n.count() * SLOT_SIZE;
+    if slots_end > start || start > page.len() {
+        return Err(Error::Corrupt("malformed tree page"));
+    }
+    // One pass without early exits: this runs on every cache miss.
+    let last = page.len() - LEAF_OVERHEAD;
+    let mut ok = true;
+    let mut used = slots_end;
+    for s in page[HEADER_SIZE..slots_end].chunks_exact(SLOT_SIZE) {
+        let off = usize::from(u16::from_le_bytes([s[0], s[1]]));
+        // Clamped so the reads stay in bounds; `ok` records the real verdict.
+        let at = off.min(last);
+        let klen = usize::from(u16::from_le_bytes([page[at], page[at + 1]]));
+        let vlen = match usize::from(u16::from_le_bytes([page[at + 2], page[at + 3]])) & vlen_mask {
+            OVERFLOW_MARK => STUB_SIZE,
+            v => v,
+        };
+        let size = overhead + klen + vlen;
+        ok &= off >= start && size <= max_cell && off + size <= page.len();
+        used += size;
+    }
+    if !ok || used > page.len() {
+        return Err(Error::Corrupt("malformed tree page"));
+    }
+    Ok(())
+}
+
+/// Pins node page `id`, checking its structure the first time it's loaded.
+fn get_node(pager: &mut Pager, id: PageId, max_cell: usize) -> Result<PageRef> {
+    let r = pager.get(id)?;
+    if !pager.is_checked(r) {
+        if let Err(e) = check_node(pager.page(r), max_cell) {
+            pager.release(r);
+            return Err(e);
+        }
+        pager.set_checked(r);
+    }
+    Ok(r)
 }
 
 /// Mutable view of a node page.
@@ -365,6 +419,8 @@ pub struct BTree {
     orphan: Option<PageId>,
     /// Whether the last insert found its key already present.
     existed: bool,
+    /// Counts calls that may have modified the tree, successful or not.
+    writes: u64,
 }
 
 /// One insert, threaded down the tree.
@@ -403,6 +459,7 @@ impl BTree {
             max_cell: (usable - HEADER_SIZE) / 4 - SLOT_SIZE,
             orphan: None,
             existed: false,
+            writes: 0,
             pager,
             root,
         }
@@ -414,6 +471,12 @@ impl BTree {
 
     pub fn pager_mut(&mut self) -> &mut Pager {
         &mut self.pager
+    }
+
+    /// Increases on every put or delete that got past argument checks, so a
+    /// caller can tell whether a failed operation may have changed the tree.
+    pub fn writes(&self) -> u64 {
+        self.writes
     }
 
     /// Largest `key.len() + value.len()` stored inline in a leaf.
@@ -470,6 +533,7 @@ impl BTree {
         if !inline && !replace && self.contains(key)? {
             return Ok(false); // don't write an overflow chain we would discard
         }
+        self.writes += 1;
         let stub;
         let (stored, overflow) = if inline {
             (value, false)
@@ -479,8 +543,13 @@ impl BTree {
             (&stub[..], true)
         };
         self.existed = false;
-        let split = self.insert(self.root, &Insert { key, value: stored, overflow, replace })?;
-        if let Some(first) = self.orphan.take() {
+        self.orphan = None;
+        let split = self.insert(self.root, &Insert { key, value: stored, overflow, replace }, 0);
+        // Taken even on error: a chain left here would be freed by a later
+        // insert, possibly after a rollback made it live again.
+        let orphan = self.orphan.take();
+        let split = split?;
+        if let Some(first) = orphan {
             self.free_overflow(first)?;
         }
         let absent = !self.existed;
@@ -489,7 +558,7 @@ impl BTree {
         };
         // Keep the root id stable: move its contents to a new left child.
         let left = self.pager.allocate()?;
-        let root = match self.pager.get(self.root) {
+        let root = match get_node(&mut self.pager, self.root, self.max_cell) {
             Ok(r) => r,
             Err(e) => {
                 self.pager.release(left);
@@ -509,6 +578,7 @@ impl BTree {
 
     /// Removes `key`, returning whether it was present.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        self.writes += 1;
         let r = self.find_leaf(key)?;
         let n = Node(self.pager.page(r));
         let (i, found) = n.lower_bound(key);
@@ -529,7 +599,7 @@ impl BTree {
     pub fn seek(&mut self, key: &[u8]) -> Result<Cursor<'_>> {
         let r = self.find_leaf(key)?;
         let (idx, _) = Node(self.pager.page(r)).lower_bound(key);
-        Ok(Cursor { pager: &mut self.pager, page: Some(r), idx, buf: Vec::new() })
+        Ok(Cursor { pager: &mut self.pager, page: Some(r), idx, buf: Vec::new(), max_cell: self.max_cell, hops: 0 })
     }
 
     /// Writes `value` to a new overflow chain, returning its first page.
@@ -549,7 +619,12 @@ impl BTree {
     }
 
     fn free_overflow(&mut self, mut id: PageId) -> Result<()> {
+        let mut left = self.pager.page_count();
         while id != NULL_PAGE {
+            if left == 0 {
+                return Err(Error::Corrupt("overflow chain cycle"));
+            }
+            left -= 1;
             let r = self.pager.get(id)?;
             let next = u64::from_le_bytes(self.pager.page(r)[0..8].try_into().unwrap());
             self.pager.release(r);
@@ -562,8 +637,8 @@ impl BTree {
     /// Descends to the leaf that may contain `key` and returns it pinned.
     fn find_leaf(&mut self, key: &[u8]) -> Result<PageRef> {
         let mut id = self.root;
-        loop {
-            let r = self.pager.get(id)?;
+        for _ in 0..MAX_HEIGHT {
+            let r = get_node(&mut self.pager, id, self.max_cell)?;
             let n = Node(self.pager.page(r));
             match n.kind() {
                 Ok(Kind::Leaf) => return Ok(r),
@@ -577,10 +652,14 @@ impl BTree {
                 }
             }
         }
+        Err(Error::Corrupt("tree too deep"))
     }
 
-    fn insert(&mut self, id: PageId, ins: &Insert) -> Result<Option<Split>> {
-        let r = self.pager.get(id)?;
+    fn insert(&mut self, id: PageId, ins: &Insert, depth: usize) -> Result<Option<Split>> {
+        if depth == MAX_HEIGHT {
+            return Err(Error::Corrupt("tree too deep"));
+        }
+        let r = get_node(&mut self.pager, id, self.max_cell)?;
         let n = Node(self.pager.page(r));
         match n.kind() {
             Ok(Kind::Leaf) => {
@@ -592,10 +671,10 @@ impl BTree {
                 let ci = n.child_index(ins.key);
                 let child = n.child(ci);
                 self.pager.release(r);
-                let Some(split) = self.insert(child, ins)? else {
+                let Some(split) = self.insert(child, ins, depth + 1)? else {
                     return Ok(None);
                 };
-                let r = self.pager.get(id)?;
+                let r = get_node(&mut self.pager, id, self.max_cell)?;
                 let res = self.insert_into_internal(r, ci, child, split);
                 self.pager.release(r);
                 res
@@ -702,6 +781,9 @@ pub struct Cursor<'t> {
     idx: usize,
     /// Holds the current value when it lives in overflow pages.
     buf: Vec<u8>,
+    max_cell: usize,
+    /// Leaves stepped to; more than the file has pages means a sibling cycle.
+    hops: u64,
 }
 
 impl Cursor<'_> {
@@ -726,7 +808,15 @@ impl Cursor<'_> {
             self.page = None;
             self.idx = 0;
             if sibling != NULL_PAGE {
-                self.page = Some(self.pager.get(sibling)?);
+                self.hops += 1;
+                if self.hops > self.pager.page_count() {
+                    return Err(Error::Corrupt("leaf sibling cycle"));
+                }
+                let r = get_node(self.pager, sibling, self.max_cell)?;
+                self.page = Some(r);
+                if !Node(self.pager.page(r)).is_leaf() {
+                    return Err(Error::Corrupt("leaf sibling is not a leaf"));
+                }
             }
         }
         Ok(None)
@@ -735,6 +825,10 @@ impl Cursor<'_> {
 
 /// Reads an overflowed value of `len` bytes starting at page `id` into `out`.
 fn read_overflow(pager: &mut Pager, len: usize, mut id: PageId, out: &mut Vec<u8>) -> Result<()> {
+    let cap = (pager.usable_size() - 8) as u64;
+    if len as u64 > pager.page_count().saturating_mul(cap) {
+        return Err(Error::Corrupt("overflow length exceeds file"));
+    }
     out.clear();
     out.reserve(len);
     while out.len() < len {
@@ -898,6 +992,46 @@ mod tests {
         let all = scan_all(&mut t);
         assert_eq!(all.len(), 50);
         assert!(all.iter().enumerate().all(|(i, (_, v))| *v == vec![i as u8; 1_000]));
+    }
+
+    /// Damage that checksums can't catch, written through the pager so the
+    /// pages are sealed: it must surface as `Corrupt`, not a panic or a hang.
+    #[test]
+    fn malformed_pages_are_corruption() {
+        let fill = |t: &mut BTree| {
+            for i in 0u32..2_000 {
+                t.put(&i.to_be_bytes(), b"value").unwrap();
+            }
+        };
+        let key = 0u32.to_be_bytes();
+
+        // A leaf slot pointing past the end of the page.
+        let dir = TempDir::new();
+        let mut t = open(dir.path(), true);
+        fill(&mut t);
+        let r = t.find_leaf(&key).unwrap();
+        NodeMut(t.pager.page_mut(r)).set_slot(0, 0xFFF0);
+        t.pager.release(r);
+        t.pager_mut().commit().unwrap();
+        drop(t);
+        let mut t = open(dir.path(), false);
+        assert!(matches!(t.get(&key), Err(Error::Corrupt(_))));
+        assert!(matches!(t.seek(&[]), Err(Error::Corrupt(_))));
+
+        // The root's rightmost child pointing back at the root.
+        let dir = TempDir::new();
+        let mut t = open(dir.path(), true);
+        fill(&mut t);
+        let r = t.pager.get(t.root).unwrap();
+        assert!(!Node(t.pager.page(r)).is_leaf());
+        NodeMut(t.pager.page_mut(r)).set_link(t.root);
+        t.pager.release(r);
+        t.pager_mut().commit().unwrap();
+        drop(t);
+        let mut t = open(dir.path(), false);
+        let last = u32::MAX.to_be_bytes();
+        assert!(matches!(t.get(&last), Err(Error::Corrupt(_))));
+        assert!(matches!(t.put(&last, b"v"), Err(Error::Corrupt(_))));
     }
 
     #[test]

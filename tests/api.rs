@@ -369,6 +369,31 @@ fn transaction_closure_commits_or_rolls_back() {
     assert_eq!(db.node_prop(id, "balance").unwrap(), Some(Value::Int(100)));
 }
 
+#[test]
+fn failed_writes_leave_a_usable_consistent_transaction() -> graphlite::Result<()> {
+    let dir = TempDir::new();
+    let mut db = Db::open(dir.db())?;
+    db.create_index("name")?;
+    let n = db.create_node(&[])?;
+    db.set_node_prop(n, "name", "alice")?;
+    db.commit()?;
+
+    // Too large to index: rejected before the old index entry is touched.
+    let huge = "x".repeat(5_000);
+    assert!(matches!(db.set_node_prop(n, "name", huge.as_str()), Err(Error::TooLarge)));
+    let m = db.create_node(&[])?;
+    db.set_node_prop(m, "bio", huge.as_str())?;
+    assert!(matches!(db.create_index("bio"), Err(Error::TooLarge)));
+    // Errors raised before any change don't poison the transaction.
+    assert!(matches!(db.add_edge(n, "KNOWS", 999), Err(Error::NodeNotFound(999))));
+    db.commit()?;
+
+    assert_eq!(db.node_prop(n, "name")?, Some(Value::from("alice")));
+    assert_eq!(db.find_nodes("name", "alice")?, [n]);
+    assert_eq!(db.find_nodes("bio", huge.as_str())?, [m], "bio is still unindexed and scanned");
+    Ok(())
+}
+
 /// Simulates crashes by copying the database and WAL while open, then
 /// truncating the copied WAL at many points: every prefix must open to
 /// exactly the state of some commit.
@@ -420,6 +445,63 @@ fn crash_recovery_yields_a_committed_state() -> graphlite::Result<()> {
     }
     assert!(seen.len() >= 3, "cuts should land in several commits: {seen:?}");
     assert!(seen.contains(&160), "the full WAL recovers the last commit");
+    Ok(())
+}
+
+/// A crash can persist a commit's frames out of order: here every frame but
+/// the first. Recovery must treat that transaction as aborted, and must keep
+/// doing so after a later, shorter commit overwrites only the start of it,
+/// leaving its commit frame on disk behind the new one.
+#[test]
+fn torn_commit_stays_aborted_after_a_shorter_commit() -> graphlite::Result<()> {
+    let opts = Options { cache_pages: 64, wal_autocheckpoint: u64::MAX, ..tiny() };
+    let (dir, torn, crashed) = (TempDir::new(), TempDir::new(), TempDir::new());
+    let snapshot = |from: &Path, to: &Path| -> std::io::Result<()> {
+        std::fs::copy(from, to)?;
+        std::fs::copy(wal_path(from), wal_path(to)).map(drop)
+    };
+    let v1 = |db: &mut Db| -> graphlite::Result<usize> {
+        let mut n = 0;
+        for id in 0..300 {
+            n += usize::from(db.node_prop(id, "v")? == Some(Value::Int(1)));
+        }
+        Ok(n)
+    };
+    {
+        let mut db = Db::open_with(dir.db(), &opts)?;
+        for _ in 0..300 {
+            let n = db.create_node(&[])?;
+            db.set_node_prop(n, "v", 0)?;
+        }
+        db.commit()?;
+        db.close()?;
+    }
+
+    // Transaction A touches every leaf; its first frame never reaches disk.
+    let mut db = Db::open_with(dir.db(), &opts)?;
+    for id in 0..300 {
+        db.set_node_prop(id, "v", 1)?;
+    }
+    db.commit()?;
+    snapshot(&dir.db(), &torn.db())?;
+    let mut wal = std::fs::read(wal_path(&torn.db()))?;
+    let frame = 24 + 512;
+    assert!(wal.len() > 32 + 10 * frame, "A should span many frames");
+    wal[32..32 + frame].fill(0);
+    std::fs::write(wal_path(&torn.db()), wal)?;
+
+    // Transaction B commits a few frames over the start of A's.
+    let mut db = Db::open_with(torn.db(), &opts)?;
+    assert_eq!(v1(&mut db)?, 0, "A never committed");
+    let n = db.create_node(&["New"])?;
+    db.set_node_prop(n, "v", 2)?;
+    db.commit()?;
+    snapshot(&torn.db(), &crashed.db())?;
+
+    let mut db = Db::open_with(crashed.db(), &opts)?;
+    assert_eq!(db.node_count()?, 301);
+    assert_eq!(v1(&mut db)?, 0, "frames of the aborted A resurfaced");
+    assert_eq!(db.node_prop(300, "v")?, Some(Value::Int(2)));
     Ok(())
 }
 

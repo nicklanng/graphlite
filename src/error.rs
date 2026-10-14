@@ -18,6 +18,9 @@ pub enum Error {
     Locked,
     NodeNotFound(u64),
     EdgeNotFound,
+    /// An earlier write or commit failed partway, so the transaction may be
+    /// half-applied. Call `Db::rollback` before writing again.
+    RollbackRequired,
 }
 
 impl fmt::Display for Error {
@@ -32,6 +35,7 @@ impl fmt::Display for Error {
             Error::Locked => f.write_str("database is locked by another handle"),
             Error::NodeNotFound(id) => write!(f, "node {id} does not exist"),
             Error::EdgeNotFound => f.write_str("edge does not exist"),
+            Error::RollbackRequired => f.write_str("an earlier write failed partway; roll back the transaction"),
         }
     }
 }

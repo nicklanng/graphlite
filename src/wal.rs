@@ -11,13 +11,23 @@
 //!
 //! ```text
 //! header (32 bytes):  magic [16] | page_size u32 | salt u32 | crc u32 | pad
-//! frame:              page_id u64 | commit u32 | salt u32 | crc u32 | pad u32 | page
+//! frame:              page_id u64 | commit u32 | salt u32 | crc u32 | txn_crc u32 | page
 //! ```
 //!
 //! Pages arrive sealed with their own trailing CRC-32C, so the frame crc only
 //! covers the first 16 header bytes plus that page checksum; recovery checks
 //! both. The salt changes on every reset, so frames left over from an earlier
 //! generation are never mistaken for current ones.
+//!
+//! Within one generation, frames from a transaction that never committed can
+//! outlive it: a rollback, or a crash that persisted only some of a commit's
+//! frames, leaves them on disk where a later, shorter transaction doesn't
+//! overwrite them. So a commit frame's `txn_crc` covers the header and page
+//! checksum of every frame in its transaction, chained from the previous
+//! commit's `txn_crc` (from the log header's crc for the first). A stale commit
+//! frame then fails the check, because the frames before it aren't the ones it
+//! was written after. Non-commit frames carry 0, which leaves pending frames
+//! free to be overwritten in place.
 
 use std::fs::File;
 
@@ -27,14 +37,20 @@ use crate::hash::IdMap;
 use crate::io::{read_at, write_at};
 use crate::pager::PageId;
 
-const MAGIC: &[u8; 16] = b"graphlite wal 2\0";
+const MAGIC: &[u8; 16] = b"graphlite wal 3\0";
+/// Magic up to the version digit, to recognize logs from other versions.
+const MAGIC_PREFIX: &[u8] = b"graphlite wal ";
 const HEADER_SIZE: u64 = 32;
 const FRAME_HEADER_SIZE: usize = 24;
+/// Per frame in a transaction checksum: the first 16 header bytes and the page checksum.
+const RECORD_SIZE: usize = 20;
 
 pub struct Wal {
     file: File,
     page_size: usize,
     salt: u32,
+    /// `txn_crc` of the last commit, or the header crc if there is none.
+    chain: u32,
     /// Frames `[0, committed_frames)` are durable.
     committed_frames: u64,
     /// Frames `[committed_frames, frames)` belong to the open transaction.
@@ -43,6 +59,8 @@ pub struct Wal {
     committed: IdMap<u64>,
     /// Latest frame for each page written by the open transaction.
     pending: IdMap<u64>,
+    /// The checksum record of each frame in the open transaction, in order.
+    txn: Vec<u8>,
     /// Reused buffer for one frame (header + page).
     buf: Vec<u8>,
 }
@@ -55,32 +73,42 @@ impl Wal {
             file,
             page_size,
             salt: 0,
+            chain: 0,
             committed_frames: 0,
             frames: 0,
             committed: IdMap::default(),
             pending: IdMap::default(),
+            txn: Vec::new(),
             buf: vec![0u8; FRAME_HEADER_SIZE + page_size],
         };
         match wal.read_header()? {
-            Some(salt) if !reset => {
+            Some((salt, crc)) if !reset => {
                 wal.salt = salt;
+                wal.chain = crc;
                 wal.recover()?;
             }
             prev => {
-                wal.salt = prev.unwrap_or_else(seed_salt);
+                wal.salt = prev.map_or_else(seed_salt, |(salt, _)| salt);
                 wal.reset()?;
             }
         }
         Ok(wal)
     }
 
-    /// Returns the salt from a valid header, or `None` for an empty or torn one.
-    fn read_header(&mut self) -> Result<Option<u32>> {
-        if self.file.metadata()?.len() < HEADER_SIZE {
+    /// Returns the salt and crc from a valid header, or `None` for an empty
+    /// or torn one.
+    fn read_header(&mut self) -> Result<Option<(u32, u32)>> {
+        let len = self.file.metadata()?.len();
+        if len < HEADER_SIZE {
             return Ok(None);
         }
         let mut h = [0u8; HEADER_SIZE as usize];
         read_at(&self.file, &mut h, 0)?;
+        if h.starts_with(MAGIC_PREFIX) && &h[0..16] != MAGIC && len > HEADER_SIZE {
+            // Frames in a format this version can't verify: refuse rather
+            // than discard transactions that may not be checkpointed yet.
+            return Err(Error::UnsupportedVersion(u32::from(h[14].wrapping_sub(b'0'))));
+        }
         let crc = u32::from_le_bytes(h[24..28].try_into().unwrap());
         if &h[0..16] != MAGIC || crc32(&h[..24]) != crc {
             // A torn header can only come from a crash during reset, which
@@ -91,7 +119,7 @@ impl Wal {
         if page_size != self.page_size {
             return Err(Error::Corrupt("wal page size does not match database"));
         }
-        Ok(Some(u32::from_le_bytes(h[20..24].try_into().unwrap())))
+        Ok(Some((u32::from_le_bytes(h[20..24].try_into().unwrap()), crc)))
     }
 
     fn recover(&mut self) -> Result<()> {
@@ -108,14 +136,26 @@ impl Wal {
                 break;
             }
             let id = u64::from_le_bytes(h[0..8].try_into().unwrap());
+            let commit = u32::from_le_bytes(h[8..12].try_into().unwrap()) != 0;
+            let txn_crc = u32::from_le_bytes(h[20..24].try_into().unwrap());
+            self.txn.extend_from_slice(&record(&self.buf));
+            if commit {
+                let sum = txn_checksum(self.chain, &self.txn);
+                if sum != txn_crc {
+                    break; // written after different frames: a stale commit
+                }
+                self.chain = sum;
+                self.txn.clear();
+            }
             self.pending.insert(id, n);
             n += 1;
-            if u32::from_le_bytes(h[8..12].try_into().unwrap()) != 0 {
+            if commit {
                 self.committed.extend(self.pending.drain());
                 self.committed_frames = n;
             }
         }
         self.pending.clear();
+        self.txn.clear();
         self.frames = self.committed_frames;
         Ok(())
     }
@@ -170,8 +210,15 @@ impl Wal {
         h[0..8].copy_from_slice(&id.to_le_bytes());
         h[8..12].copy_from_slice(&u32::from(commit).to_le_bytes());
         h[12..16].copy_from_slice(&self.salt.to_le_bytes());
-        h[20..24].fill(0);
         self.buf[FRAME_HEADER_SIZE..].copy_from_slice(page);
+        let at = (n - self.committed_frames) as usize * RECORD_SIZE;
+        if at == self.txn.len() {
+            self.txn.extend_from_slice(&record(&self.buf));
+        } else {
+            self.txn[at..at + RECORD_SIZE].copy_from_slice(&record(&self.buf));
+        }
+        let txn_crc = if commit { txn_checksum(self.chain, &self.txn) } else { 0 };
+        self.buf[20..24].copy_from_slice(&txn_crc.to_le_bytes());
         let crc = frame_crc(&self.buf);
         self.buf[16..20].copy_from_slice(&crc.to_le_bytes());
         let off = self.frame_offset(n);
@@ -182,6 +229,8 @@ impl Wal {
     /// Makes the open transaction durable. Its last frame must be a commit frame.
     pub fn commit(&mut self) -> Result<()> {
         self.file.sync_data()?;
+        self.chain = txn_checksum(self.chain, &self.txn);
+        self.txn.clear();
         self.committed.extend(self.pending.drain());
         self.committed_frames = self.frames;
         Ok(())
@@ -190,6 +239,7 @@ impl Wal {
     /// Forgets the open transaction's frames; later writes overwrite them.
     pub fn rollback(&mut self) {
         self.pending.clear();
+        self.txn.clear();
         self.frames = self.committed_frames;
     }
 
@@ -212,6 +262,7 @@ impl Wal {
         write_at(&self.file, &h, 0)?;
         self.file.set_len(HEADER_SIZE)?;
         self.file.sync_data()?;
+        self.chain = crc;
         self.committed.clear();
         self.committed_frames = 0;
         self.frames = 0;
@@ -226,6 +277,22 @@ fn frame_crc(frame: &[u8]) -> u32 {
     c.finish()
 }
 
+/// The part of a frame its transaction's checksum covers.
+fn record(frame: &[u8]) -> [u8; RECORD_SIZE] {
+    let mut r = [0u8; RECORD_SIZE];
+    r[..16].copy_from_slice(&frame[..16]);
+    r[16..].copy_from_slice(&frame[frame.len() - 4..]);
+    r
+}
+
+/// Checksum of a transaction's frame records, chained from the previous commit.
+fn txn_checksum(chain: u32, records: &[u8]) -> u32 {
+    let mut c = Hasher::new();
+    c.update(&chain.to_le_bytes());
+    c.update(records);
+    c.finish()
+}
+
 fn page_intact(page: &[u8]) -> bool {
     let (body, sum) = page.split_at(page.len() - 4);
     crc32(body) == u32::from_le_bytes(sum.try_into().unwrap())
@@ -234,4 +301,26 @@ fn page_intact(page: &[u8]) -> bool {
 fn seed_salt() -> u32 {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (t.as_nanos() as u32) ^ std::process::id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn logs_from_other_versions_are_refused_unless_empty() {
+        let dir = TempDir::new();
+        let path = dir.path().join("t.db-wal");
+        let open = || OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut old = vec![0u8; HEADER_SIZE as usize];
+        old[..16].copy_from_slice(b"graphlite wal 2\0");
+        std::fs::write(&path, &old).unwrap();
+        Wal::open(open(), 512, false).expect("an empty old log is simply reset");
+
+        old.resize(HEADER_SIZE as usize + FRAME_HEADER_SIZE + 512, 7);
+        std::fs::write(&path, &old).unwrap();
+        assert!(matches!(Wal::open(open(), 512, false), Err(Error::UnsupportedVersion(2))));
+    }
 }

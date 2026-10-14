@@ -78,6 +78,9 @@ struct Frame {
     pins: u32,
     dirty: bool,
     referenced: bool,
+    /// Set by the caller once it has validated the page's structure, so it
+    /// only does so once per load from disk.
+    checked: bool,
 }
 
 /// Database state recorded in the header page.
@@ -265,6 +268,15 @@ impl Pager {
         self.frames[r.0 as usize].id
     }
 
+    /// Whether [`Pager::set_checked`] was called since the page was loaded.
+    pub fn is_checked(&self, r: PageRef) -> bool {
+        self.frames[r.0 as usize].checked
+    }
+
+    pub fn set_checked(&mut self, r: PageRef) {
+        self.frames[r.0 as usize].checked = true;
+    }
+
     pub fn page(&self, r: PageRef) -> &[u8] {
         let range = self.frame_range(r.0);
         &self.slab[range][..self.usable_size()]
@@ -355,16 +367,16 @@ impl Pager {
     }
 
     /// Copies committed pages from the WAL into the main file and empties the
-    /// WAL. Does nothing while a transaction has written to the WAL.
+    /// WAL. Does nothing while a transaction has uncommitted changes.
     pub fn checkpoint(&mut self) -> Result<()> {
-        if self.wal.has_pending() || !self.wal.has_committed() {
+        if self.has_changes() || !self.wal.has_committed() {
             return Ok(());
         }
         let mut buf = vec![0u8; self.page_size];
         let mut pages: Vec<(PageId, u64)> = self.wal.committed_pages().collect();
         pages.sort_unstable();
         for (id, n) in pages {
-            let offset = id * self.page_size as u64;
+            let offset = id.checked_mul(self.page_size as u64).ok_or(Error::Corrupt("page id out of range"))?;
             // With no open transaction, a cached page is clean, sealed, and
             // identical to its newest committed frame, so skip the WAL read.
             if let Some(&i) = self.map.get(&id) {
@@ -388,7 +400,7 @@ impl Pager {
     }
 
     fn install(&mut self, i: u32, id: PageId, dirty: bool) {
-        self.frames[i as usize] = Frame { id, pins: 1, dirty, referenced: true };
+        self.frames[i as usize] = Frame { id, pins: 1, dirty, referenced: true, checked: false };
         self.map.insert(id, i);
     }
 
@@ -444,7 +456,8 @@ impl Drop for Pager {
 
 /// Reads page `id` of the main file into `buf` (one full page) and verifies it.
 fn read_page(file: &File, id: PageId, buf: &mut [u8]) -> Result<()> {
-    read_at(file, buf, id * buf.len() as u64)?;
+    let offset = id.checked_mul(buf.len() as u64).ok_or(Error::Corrupt("page id out of range"))?;
+    read_at(file, buf, offset)?;
     verify(buf)
 }
 
@@ -562,6 +575,24 @@ mod tests {
         assert_eq!(p.page_count(), 6);
         assert_filled(&mut p, &kept, 1);
         assert!(p.get(lost[0]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_skips_uncommitted_cached_pages() {
+        let dir = TempDir::new();
+        let mut p = create(dir.path(), &small());
+        let ids = fill_pages(&mut p, 3, 1);
+        p.commit().unwrap();
+        // Dirty a cached page without spilling it, so the WAL has nothing pending.
+        let r = p.get(ids[0]).unwrap();
+        p.page_mut(r).fill(9);
+        p.release(r);
+        assert!(!p.wal.has_pending());
+        p.checkpoint().unwrap();
+        assert_eq!(p.stats().checkpoints, 0);
+        std::mem::forget(p); // crash
+        let mut p = open(dir.path(), &small());
+        assert_filled(&mut p, &ids, 1);
     }
 
     #[test]

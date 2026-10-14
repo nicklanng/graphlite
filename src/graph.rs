@@ -131,6 +131,12 @@ fn be_u64(b: &[u8], off: usize) -> Result<u64> {
 /// Changes form an implicit transaction that becomes durable and visible
 /// after a crash only on [`Db::commit`]. [`Db::rollback`] discards it, and so
 /// does dropping the `Db`.
+///
+/// A write that fails after changing anything (an I/O error halfway through
+/// [`Db::delete_node`], say) may leave the transaction half-applied. Further
+/// writes and commits then return [`Error::RollbackRequired`] until
+/// [`Db::rollback`]. Errors raised before anything changed, such as
+/// [`Error::NodeNotFound`], leave the transaction usable.
 pub struct Db {
     tree: BTree,
     /// Symbol caches, cleared on rollback since symbols are transactional.
@@ -140,6 +146,8 @@ pub struct Db {
     /// Counter values, written back to the tree at commit; cleared on rollback.
     counters: HashMap<&'static [u8], u64>,
     counters_dirty: bool,
+    /// A write or commit failed partway; only a rollback is accepted.
+    poisoned: bool,
 }
 
 impl Db {
@@ -156,7 +164,13 @@ impl Db {
         lock(&file)?;
         let mut wal_path = OsString::from(path.as_os_str());
         wal_path.push("-wal");
-        let wal = open(Path::new(&wal_path))?;
+        let wal_path = Path::new(&wal_path);
+        let wal_existed = wal_path.try_exists()?;
+        let wal = open(wal_path)?;
+        if file.metadata()?.len() == 0 || !wal_existed {
+            // Make the new directory entries durable before any commit relies on them.
+            sync_dir(path)?;
+        }
 
         let pager = if file.metadata()?.len() == 0 {
             Pager::create(file, wal, opts)?
@@ -179,18 +193,31 @@ impl Db {
             indexed: None,
             counters: HashMap::new(),
             counters_dirty: false,
+            poisoned: false,
         })
     }
 
     /// Atomically and durably applies every change since the last commit.
+    ///
+    /// If this fails, the transaction must be rolled back. The commit may
+    /// still have reached the disk, so a crash afterwards can reveal it.
     pub fn commit(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::RollbackRequired);
+        }
+        let res = self.flush_counters().and_then(|()| self.tree.pager_mut().commit());
+        self.poisoned = res.is_err();
+        res
+    }
+
+    fn flush_counters(&mut self) -> Result<()> {
         if self.counters_dirty {
             for (name, v) in &self.counters {
                 self.tree.put(&Key::new(META).bytes(name), &v.to_be_bytes())?;
             }
             self.counters_dirty = false;
         }
-        self.tree.pager_mut().commit()
+        Ok(())
     }
 
     /// Discards every change since the last commit.
@@ -201,19 +228,24 @@ impl Db {
         self.indexed = None;
         self.counters.clear();
         self.counters_dirty = false;
+        self.poisoned = false;
     }
 
     /// Runs `f`, then commits if it returns `Ok` or rolls back if it returns
-    /// `Err`. Uncommitted changes made before the call are included.
+    /// `Err` or the commit fails. Uncommitted changes made before the call
+    /// are included.
     pub fn transaction<T, E: From<Error>>(
         &mut self,
         f: impl FnOnce(&mut Db) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         match f(self) {
-            Ok(v) => {
-                self.commit()?;
-                Ok(v)
-            }
+            Ok(v) => match self.commit() {
+                Ok(()) => Ok(v),
+                Err(e) => {
+                    self.rollback();
+                    Err(e.into())
+                }
+            },
             Err(e) => {
                 self.rollback();
                 Err(e)
@@ -243,14 +275,16 @@ impl Db {
     /// Creates a node with the given labels and returns its id. Ids are
     /// dense and never reused.
     pub fn create_node(&mut self, labels: &[&str]) -> Result<NodeId> {
-        let id = self.counter(NEXT_NODE)?;
-        self.set_counter(NEXT_NODE, id + 1)?;
-        self.tree.put(&Key::new(NODE).u64(id), &[])?;
-        self.bump(NODE_COUNT, 1)?;
-        for label in labels {
-            self.add_label(id, label)?;
-        }
-        Ok(id)
+        self.write(|db| {
+            let id = db.counter(NEXT_NODE)?;
+            db.tree.put(&Key::new(NODE).u64(id), &[])?;
+            db.set_counter(NEXT_NODE, id + 1)?;
+            db.bump(NODE_COUNT, 1)?;
+            for label in labels {
+                db.add_label(id, label)?;
+            }
+            Ok(id)
+        })
     }
 
     pub fn node_exists(&mut self, id: NodeId) -> Result<bool> {
@@ -260,25 +294,27 @@ impl Db {
     /// Deletes a node with its labels, properties, and every edge touching
     /// it. Returns whether the node existed.
     pub fn delete_node(&mut self, id: NodeId) -> Result<bool> {
-        if !self.node_exists(id)? {
-            return Ok(false);
-        }
-        for (src, t, dst) in self.edge_ids(id, Direction::Both)? {
-            self.remove_edge_ids(src, t, dst)?;
-        }
-        for k in self.scan_keys(&Key::new(NODE_LABEL).u64(id))? {
-            let label = be_u32(&k, 9)?;
-            self.tree.delete(&k)?;
-            self.tree.delete(&Key::new(LABEL_INDEX).u32(label).u64(id))?;
-        }
-        for (k, v) in self.scan(&Key::new(NODE_PROP).u64(id))? {
-            let key = be_u32(&k, 9)?;
-            self.unindex(key, &v, id)?;
-            self.tree.delete(&k)?;
-        }
-        self.tree.delete(&Key::new(NODE).u64(id))?;
-        self.bump(NODE_COUNT, -1)?;
-        Ok(true)
+        self.write(|db| {
+            if !db.node_exists(id)? {
+                return Ok(false);
+            }
+            for (src, t, dst) in db.edge_ids(id, Direction::Both)? {
+                db.remove_edge_ids(src, t, dst)?;
+            }
+            for k in db.scan_keys(&Key::new(NODE_LABEL).u64(id))? {
+                let label = be_u32(&k, 9)?;
+                db.tree.delete(&k)?;
+                db.tree.delete(&Key::new(LABEL_INDEX).u32(label).u64(id))?;
+            }
+            for (k, v) in db.scan(&Key::new(NODE_PROP).u64(id))? {
+                let key = be_u32(&k, 9)?;
+                db.unindex(key, &v, id)?;
+                db.tree.delete(&k)?;
+            }
+            db.tree.delete(&Key::new(NODE).u64(id))?;
+            db.bump(NODE_COUNT, -1)?;
+            Ok(true)
+        })
     }
 
     pub fn node_count(&mut self) -> Result<u64> {
@@ -289,23 +325,27 @@ impl Db {
 
     /// Adds `label` to the node. Returns false if it already had it.
     pub fn add_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
-        self.require_node(id)?;
-        let l = self.intern(Sym::Label, label)?;
-        if !self.tree.put_if_absent(&Key::new(NODE_LABEL).u64(id).u32(l), &[])? {
-            return Ok(false);
-        }
-        self.tree.put(&Key::new(LABEL_INDEX).u32(l).u64(id), &[])?;
-        Ok(true)
+        self.write(|db| {
+            db.require_node(id)?;
+            let l = db.intern(Sym::Label, label)?;
+            if !db.tree.put_if_absent(&Key::new(NODE_LABEL).u64(id).u32(l), &[])? {
+                return Ok(false);
+            }
+            db.tree.put(&Key::new(LABEL_INDEX).u32(l).u64(id), &[])?;
+            Ok(true)
+        })
     }
 
     /// Removes `label` from the node. Returns whether it had it.
     pub fn remove_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
-        let Some(l) = self.symbol(Sym::Label, label)? else {
-            return Ok(false);
-        };
-        let found = self.tree.delete(&Key::new(NODE_LABEL).u64(id).u32(l))?;
-        self.tree.delete(&Key::new(LABEL_INDEX).u32(l).u64(id))?;
-        Ok(found)
+        self.write(|db| {
+            let Some(l) = db.symbol(Sym::Label, label)? else {
+                return Ok(false);
+            };
+            let found = db.tree.delete(&Key::new(NODE_LABEL).u64(id).u32(l))?;
+            db.tree.delete(&Key::new(LABEL_INDEX).u32(l).u64(id))?;
+            Ok(found)
+        })
     }
 
     pub fn has_label(&mut self, id: NodeId, label: &str) -> Result<bool> {
@@ -339,17 +379,23 @@ impl Db {
     // ---- node properties ----
 
     pub fn set_node_prop(&mut self, id: NodeId, key: &str, value: impl Into<Value>) -> Result<()> {
-        self.require_node(id)?;
-        let k = self.intern(Sym::PropKey, key)?;
-        let enc = value.into().encode();
-        let pk = Key::new(NODE_PROP).u64(id).u32(k);
-        if self.is_indexed(k)? {
-            if let Some(old) = self.tree.get(&pk)? {
-                self.unindex(k, &old, id)?;
+        self.write(|db| {
+            db.require_node(id)?;
+            let k = db.intern(Sym::PropKey, key)?;
+            let enc = value.into().encode();
+            let pk = Key::new(NODE_PROP).u64(id).u32(k);
+            if db.is_indexed(k)? {
+                let ik = Key::new(PROP_INDEX).u32(k).bytes(&enc).u64(id);
+                if ik.len() > db.tree.max_key_len() {
+                    return Err(Error::TooLarge);
+                }
+                if let Some(old) = db.tree.get(&pk)? {
+                    db.unindex(k, &old, id)?;
+                }
+                db.tree.put(&ik, &[])?;
             }
-            self.tree.put(&Key::new(PROP_INDEX).u32(k).bytes(&enc).u64(id), &[])?;
-        }
-        self.tree.put(&pk, &enc)
+            db.tree.put(&pk, &enc)
+        })
     }
 
     pub fn node_prop(&mut self, id: NodeId, key: &str) -> Result<Option<Value>> {
@@ -370,16 +416,18 @@ impl Db {
 
     /// Removes a property, returning its old value.
     pub fn remove_node_prop(&mut self, id: NodeId, key: &str) -> Result<Option<Value>> {
-        let Some(k) = self.symbol(Sym::PropKey, key)? else {
-            return Ok(None);
-        };
-        let pk = Key::new(NODE_PROP).u64(id).u32(k);
-        let Some(old) = self.tree.get(&pk)? else {
-            return Ok(None);
-        };
-        self.unindex(k, &old, id)?;
-        self.tree.delete(&pk)?;
-        Value::decode_all(&old).map(Some)
+        self.write(|db| {
+            let Some(k) = db.symbol(Sym::PropKey, key)? else {
+                return Ok(None);
+            };
+            let pk = Key::new(NODE_PROP).u64(id).u32(k);
+            let Some(old) = db.tree.get(&pk)? else {
+                return Ok(None);
+            };
+            db.unindex(k, &old, id)?;
+            db.tree.delete(&pk)?;
+            Value::decode_all(&old).map(Some)
+        })
     }
 
     // ---- indexes ----
@@ -388,37 +436,53 @@ impl Db {
     /// node. Existing values are indexed immediately. Indexed values must fit
     /// in a key (about 1 KiB at the default page size).
     pub fn create_index(&mut self, key: &str) -> Result<()> {
-        let k = self.intern(Sym::PropKey, key)?;
-        if self.is_indexed(k)? {
-            return Ok(());
-        }
-        let entries: Vec<(NodeId, Vec<u8>)> = self
-            .scan(&[NODE_PROP])?
-            .into_iter()
-            .filter(|(pk, _)| be_u32(pk, 9).is_ok_and(|pk_key| pk_key == k))
-            .map(|(pk, v)| be_u64(&pk, 1).map(|id| (id, v)))
-            .collect::<Result<_>>()?;
-        for (id, v) in entries {
-            self.tree.put(&Key::new(PROP_INDEX).u32(k).bytes(&v).u64(id), &[])?;
-        }
-        self.tree.put(&Key::new(INDEXED).u32(k), &[])?;
-        self.indexed.get_or_insert_with(HashSet::new).insert(k);
-        Ok(())
+        self.write(|db| {
+            let k = db.intern(Sym::PropKey, key)?;
+            if db.is_indexed(k)? {
+                return Ok(());
+            }
+            // Build every entry first, so a value too large to index fails
+            // the call before anything is written.
+            let max_key = db.tree.max_key_len();
+            let mut entries = Vec::new();
+            let mut c = db.tree.seek(&[NODE_PROP])?;
+            while let Some((pk, v)) = c.next()? {
+                if pk.first() != Some(&NODE_PROP) {
+                    break;
+                }
+                if be_u32(pk, 9)? == k {
+                    let ik = Key::new(PROP_INDEX).u32(k).bytes(v).u64(be_u64(pk, 1)?);
+                    if ik.len() > max_key {
+                        return Err(Error::TooLarge);
+                    }
+                    entries.push(ik);
+                }
+            }
+            drop(c);
+            for ik in entries {
+                db.tree.put(&ik, &[])?;
+            }
+            db.tree.put(&Key::new(INDEXED).u32(k), &[])?;
+            db.indexed.get_or_insert_with(HashSet::new).insert(k);
+            Ok(())
+        })
     }
 
     pub fn drop_index(&mut self, key: &str) -> Result<bool> {
-        let Some(k) = self.symbol(Sym::PropKey, key)? else {
-            return Ok(false);
-        };
-        if !self.is_indexed(k)? {
-            return Ok(false);
-        }
-        for k in self.scan_keys(&Key::new(PROP_INDEX).u32(k))? {
-            self.tree.delete(&k)?;
-        }
-        self.tree.delete(&Key::new(INDEXED).u32(k))?;
-        self.indexed.as_mut().unwrap().remove(&k);
-        Ok(true)
+        self.write(|db| {
+            let Some(k) = db.symbol(Sym::PropKey, key)? else {
+                return Ok(false);
+            };
+            if !db.is_indexed(k)? {
+                return Ok(false);
+            }
+            for k in db.scan_keys(&Key::new(PROP_INDEX).u32(k))? {
+                db.tree.delete(&k)?;
+            }
+            db.tree.delete(&Key::new(INDEXED).u32(k))?;
+            db.indexed.as_mut().unwrap().remove(&k);
+            Ok(true)
+        })
     }
 
     /// Nodes whose property `key` equals `value`, in id order. Uses the
@@ -447,25 +511,29 @@ impl Db {
     /// Adds the edge `src -[edge_type]-> dst`. Returns false if it already
     /// existed; there is at most one edge per (src, type, dst).
     pub fn add_edge(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-        self.require_node(src)?;
-        if dst != src {
-            self.require_node(dst)?;
-        }
-        let t = self.intern(Sym::EdgeType, edge_type)?;
-        if !self.tree.put_if_absent(&Key::new(OUT).u64(src).u32(t).u64(dst), &[])? {
-            return Ok(false);
-        }
-        self.tree.put(&Key::new(IN).u64(dst).u32(t).u64(src), &[])?;
-        self.bump(EDGE_COUNT, 1)?;
-        Ok(true)
+        self.write(|db| {
+            db.require_node(src)?;
+            if dst != src {
+                db.require_node(dst)?;
+            }
+            let t = db.intern(Sym::EdgeType, edge_type)?;
+            if !db.tree.put_if_absent(&Key::new(OUT).u64(src).u32(t).u64(dst), &[])? {
+                return Ok(false);
+            }
+            db.tree.put(&Key::new(IN).u64(dst).u32(t).u64(src), &[])?;
+            db.bump(EDGE_COUNT, 1)?;
+            Ok(true)
+        })
     }
 
     /// Removes the edge and its properties. Returns whether it existed.
     pub fn remove_edge(&mut self, src: NodeId, edge_type: &str, dst: NodeId) -> Result<bool> {
-        match self.symbol(Sym::EdgeType, edge_type)? {
-            Some(t) => self.remove_edge_ids(src, t, dst),
-            None => Ok(false),
-        }
+        self.write(|db| {
+            match db.symbol(Sym::EdgeType, edge_type)? {
+                Some(t) => db.remove_edge_ids(src, t, dst),
+                None => Ok(false),
+            }
+        })
     }
 
     fn remove_edge_ids(&mut self, src: NodeId, t: u32, dst: NodeId) -> Result<bool> {
@@ -556,12 +624,14 @@ impl Db {
         key: &str,
         value: impl Into<Value>,
     ) -> Result<()> {
-        let t = self.symbol(Sym::EdgeType, edge_type)?.ok_or(Error::EdgeNotFound)?;
-        if !self.tree.contains(&Key::new(OUT).u64(src).u32(t).u64(dst))? {
-            return Err(Error::EdgeNotFound);
-        }
-        let k = self.intern(Sym::PropKey, key)?;
-        self.tree.put(&Key::new(EDGE_PROP).u64(src).u32(t).u64(dst).u32(k), &value.into().encode())
+        self.write(|db| {
+            let t = db.symbol(Sym::EdgeType, edge_type)?.ok_or(Error::EdgeNotFound)?;
+            if !db.tree.contains(&Key::new(OUT).u64(src).u32(t).u64(dst))? {
+                return Err(Error::EdgeNotFound);
+            }
+            let k = db.intern(Sym::PropKey, key)?;
+            db.tree.put(&Key::new(EDGE_PROP).u64(src).u32(t).u64(dst).u32(k), &value.into().encode())
+        })
     }
 
     pub fn edge_prop(&mut self, src: NodeId, edge_type: &str, dst: NodeId, key: &str) -> Result<Option<Value>> {
@@ -584,15 +654,17 @@ impl Db {
     }
 
     pub fn remove_edge_prop(&mut self, src: NodeId, edge_type: &str, dst: NodeId, key: &str) -> Result<Option<Value>> {
-        let (Some(t), Some(k)) = (self.symbol(Sym::EdgeType, edge_type)?, self.symbol(Sym::PropKey, key)?) else {
-            return Ok(None);
-        };
-        let pk = Key::new(EDGE_PROP).u64(src).u32(t).u64(dst).u32(k);
-        let old = self.tree.get(&pk)?;
-        if old.is_some() {
-            self.tree.delete(&pk)?;
-        }
-        old.map(|v| Value::decode_all(&v)).transpose()
+        self.write(|db| {
+            let (Some(t), Some(k)) = (db.symbol(Sym::EdgeType, edge_type)?, db.symbol(Sym::PropKey, key)?) else {
+                return Ok(None);
+            };
+            let pk = Key::new(EDGE_PROP).u64(src).u32(t).u64(dst).u32(k);
+            let old = db.tree.get(&pk)?;
+            if old.is_some() {
+                db.tree.delete(&pk)?;
+            }
+            old.map(|v| Value::decode_all(&v)).transpose()
+        })
     }
 
     // ---- traversal ----
@@ -759,6 +831,20 @@ impl Db {
 
     // ---- internals ----
 
+    /// Runs a write. If it fails after changing the tree, the transaction
+    /// may be half-applied, so it is poisoned until rolled back.
+    fn write<T>(&mut self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+        if self.poisoned {
+            return Err(Error::RollbackRequired);
+        }
+        let writes = self.tree.writes();
+        let res = f(self);
+        if res.is_err() && self.tree.writes() != writes {
+            self.poisoned = true;
+        }
+        res
+    }
+
     fn require_node(&mut self, id: NodeId) -> Result<()> {
         if self.node_exists(id)? { Ok(()) } else { Err(Error::NodeNotFound(id)) }
     }
@@ -881,10 +967,54 @@ impl Db {
     }
 }
 
+/// Fsyncs the directory holding `path`, making newly created files in it durable.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Windows has no directory fsync to call.
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn lock(file: &File) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => Err(Error::Locked),
         Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    #[test]
+    fn a_write_failing_partway_requires_rollback() {
+        let dir = TempDir::new();
+        let mut db = Db::open(dir.path().join("t.db")).unwrap();
+        let a = db.create_node(&["A"]).unwrap();
+        db.commit().unwrap();
+        // No public call fails halfway on demand, so fail one by hand.
+        let res: Result<()> = db.write(|db| {
+            db.tree.delete(&Key::new(NODE).u64(a))?;
+            Err(Error::Corrupt("injected"))
+        });
+        assert!(res.is_err());
+        assert!(matches!(db.create_node(&[]), Err(Error::RollbackRequired)));
+        assert!(matches!(db.commit(), Err(Error::RollbackRequired)));
+        db.rollback();
+        assert!(db.node_exists(a).unwrap());
+        db.create_node(&[]).unwrap();
+        db.commit().unwrap();
+        assert_eq!(db.node_count().unwrap(), 2);
     }
 }
