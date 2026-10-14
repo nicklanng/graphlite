@@ -218,4 +218,4 @@ random graph checked against an in-memory model across reopens.
 
 ## License
 
-MIT OR Apache-2.0, as declared in `Cargo.toml`.
+MIT. See [LICENSE](LICENSE).
