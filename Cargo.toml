@@ -3,7 +3,8 @@ name = "graphlite"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89" # File::try_lock
-description = "An embedded, single-file graph database"
+description = "Experimental embedded, single-file graph database: SQLite's deployment model for property graphs"
+repository = "https://github.com/nicklanng/graphlite"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
